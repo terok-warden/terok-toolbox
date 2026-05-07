@@ -55,12 +55,25 @@ console = Console(stderr=True)
 
 # ── Chain ─────────────────────────────────────────────────────────────────
 
-CHAIN = ["terok-clearance", "terok-shield", "terok-sandbox", "terok-executor", "terok"]
+CHAIN = [
+    "mkdocs-terok",
+    "terok-clearance",
+    "terok-shield",
+    "terok-sandbox",
+    "terok-executor",
+    "terok",
+]
 
 # When you add a new inter-package dep, update this table and the
 # consuming package's ``pyproject.toml`` in the same PR — the planner
 # cross-checks the two and aborts the next release otherwise.
+#
+# ``mkdocs-terok`` is a docs-only sibling: every other repo uses it for
+# their docs build but it is *not* a runtime pin in any pyproject, so it
+# stays an empty-deps leaf and the closure logic naturally never drags it
+# into a chain release. Release it on its own when it changes.
 DEPS: DepGraph = {
+    "mkdocs-terok": [],
     "terok-clearance": [],
     "terok-shield": [],
     "terok-sandbox": ["terok-shield", "terok-clearance"],
@@ -68,7 +81,11 @@ DEPS: DepGraph = {
     "terok": ["terok-executor", "terok-sandbox", "terok-shield", "terok-clearance"],
 }
 
-ALIASES = {repo.removeprefix("terok-"): repo for repo in CHAIN} | {repo: repo for repo in CHAIN}
+ALIASES = (
+    {repo.removeprefix("terok-"): repo for repo in CHAIN}
+    | {repo: repo for repo in CHAIN}
+    | {"mkdocs": "mkdocs-terok"}  # the only repo without a `terok-` prefix
+)
 
 
 # ── Tuning ────────────────────────────────────────────────────────────────
@@ -77,6 +94,7 @@ ALIASES = {repo.removeprefix("terok-"): repo for repo in CHAIN} | {repo: repo fo
 
 DEFAULT_CHECK_TIMEOUT = 1800  # 30 min — long enough for a full CI matrix
 DEFAULT_WHEEL_TIMEOUT = 300
+DEFAULT_PYPI_TIMEOUT = 600  # 10 min — TestPyPI propagation can be slow
 
 CHECK_POLL_INTERVAL = 2
 CHECK_GRACE_WINDOW = 30  # leniency before missing check data becomes a hard fail
@@ -84,6 +102,11 @@ CHECK_STATE_RECHECK = 10  # cadence for PR-state (MERGED/CLOSED) lookups
 
 WHEEL_POLL_INTERVAL = 5
 WHEEL_HEAD_TIMEOUT = 10  # per HEAD probe of the actual download URL
+
+PYPI_POLL_INTERVAL = 5
+PYPI_HTTP_TIMEOUT = 10
+WORKFLOW_DISCOVERY_POLL_INTERVAL = 2
+WORKFLOW_DISCOVERY_TIMEOUT = 60  # seconds to wait for the publish.yml run to register
 
 MERGE_RACE_POLL_COUNT = 15
 MERGE_RACE_POLL_INTERVAL = 2
@@ -181,6 +204,9 @@ class StepKind(StrEnum):
     TAG = "tag"
     RELEASE = "release"
     WHEEL_POLL = "wheel_poll"
+    WORKFLOW_DISPATCH = "workflow_dispatch"
+    WORKFLOW_WAIT = "workflow_wait"
+    PYPI_POLL = "pypi_poll"
 
 
 class Action(StrEnum):
@@ -231,6 +257,13 @@ class Plan(BaseModel):
     badge on the repo homepage).  Useful for batching half-done work that
     downstream packages need to pin against, without promoting it to the
     public release pointer."""
+    target: str = "pypi"
+    """Where each release publishes its Python wheel: ``"pypi"`` (the default
+    production path — tag push auto-triggers ``publish.yml`` and lands on
+    PyPI) or ``"testpypi"`` (the dry-run path — chain script dispatches
+    ``publish.yml`` with ``target=testpypi`` so the publish job routes to
+    TestPyPI instead).  Either way the chain still cuts the GitHub Release
+    and writes the GH release wheel for legacy URL pins."""
     created_at: str = Field(default_factory=lambda: datetime.now(UTC).isoformat())
 
 
@@ -247,6 +280,7 @@ class Ctx:
     skip_checks: bool = False
     check_timeout: int = DEFAULT_CHECK_TIMEOUT
     wheel_timeout: int = DEFAULT_WHEEL_TIMEOUT
+    pypi_timeout: int = DEFAULT_PYPI_TIMEOUT
     plan_path: Path | None = None
 
 
@@ -619,6 +653,60 @@ def wait_for_wheel(repo: str, version: str, org: str, timeout: int = DEFAULT_WHE
     die(f"Timed out waiting for {expected}")
 
 
+# ── PyPI / Trusted-Publishing helpers ─────────────────────────────────────
+
+
+def _find_publish_run(gh_repo: str, ref: str, event: str) -> str:
+    """Return the most recent ``publish.yml`` run for *ref* fired by *event*.
+
+    Polls briefly because the run takes a moment to register after a
+    tag push (auto-trigger) or ``gh workflow run`` (dispatch). ``ref``
+    is the tag name without the ``refs/tags/`` prefix; ``event`` is one
+    of ``"push"`` (for ``target=pypi`` — auto-triggered run) or
+    ``"workflow_dispatch"`` (for ``target=testpypi`` — script-dispatched).
+    """
+    for _ in range(0, WORKFLOW_DISCOVERY_TIMEOUT, WORKFLOW_DISCOVERY_POLL_INTERVAL):
+        r = sh(
+            "gh", "run", "list",
+            "--repo", gh_repo,
+            "--workflow", "publish.yml",
+            "--event", event,
+            "--branch", ref,            # head_branch == tag for both events
+            "--limit", "1",
+            "--json", "databaseId,status",
+            capture=True, check=False,
+        )  # fmt: skip
+        if r.returncode == 0 and r.stdout.strip():
+            runs = json.loads(r.stdout)
+            if runs:
+                return str(runs[0]["databaseId"])
+        time.sleep(WORKFLOW_DISCOVERY_POLL_INTERVAL)
+    die(f"No publish.yml run found for {gh_repo} ref {ref} (event={event})")
+
+
+def wait_for_pypi(repo: str, version: str, target: str, timeout: int) -> None:
+    """Block until *repo*-*version* resolves on the chosen index.
+
+    Uses PyPI's JSON metadata endpoint — a 200 there means the version
+    is fully indexed and ``pip install`` would succeed. ``target`` is
+    one of ``"pypi"`` or ``"testpypi"``.
+    """
+    base = "https://test.pypi.org" if target == "testpypi" else "https://pypi.org"
+    url = f"{base}/pypi/{repo}/{version}/json"
+    console.print(f"Waiting for {repo} {version} on {target}...")
+    for _elapsed in range(0, timeout, PYPI_POLL_INTERVAL):
+        try:
+            req = urllib.request.Request(url)  # noqa: S310 — public PyPI endpoint
+            with urllib.request.urlopen(req, timeout=PYPI_HTTP_TIMEOUT) as resp:  # noqa: S310
+                if resp.status == 200:  # noqa: PLR2004
+                    console.print(f"[green]Available on {target}![/]")
+                    return
+        except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError):
+            pass
+        time.sleep(PYPI_POLL_INTERVAL)
+    die(f"Timed out waiting for {repo} {version} on {target}")
+
+
 # ── Planner ───────────────────────────────────────────────────────────────
 
 
@@ -642,7 +730,7 @@ def _branch_for(pkg: PackagePlan, release_name: str) -> str:
     return f"{BUMP_DEPS_BRANCH_PREFIX}{'-' + suffix if suffix else ''}"
 
 
-def plan_steps(pkg: PackagePlan, org: str, fork: str, name: str) -> list[Step]:
+def plan_steps(pkg: PackagePlan, org: str, fork: str, name: str, target: str) -> list[Step]:
     """Linear step sequence that realises one package's work in the plan."""
     do_release = pkg.action in (Action.RELEASE_MASTER, Action.RELEASE_PR)
     needs_new_pr = pkg.action == Action.RELEASE_MASTER or (
@@ -684,6 +772,14 @@ def plan_steps(pkg: PackagePlan, org: str, fork: str, name: str) -> list[Step]:
         add(StepKind.TAG, tag=tag, title=title)
         add(StepKind.RELEASE, tag=tag, title=title)
         add(StepKind.WHEEL_POLL, version=pkg.new_version)
+        # PyPI publication. ``target=pypi`` rides the auto-trigger from the
+        # tag push that just happened in TAG; ``target=testpypi`` overrides
+        # by dispatching publish.yml so the workflow's target input lands on
+        # TestPyPI instead of the auto-trigger's PyPI default.
+        if target == "testpypi":
+            add(StepKind.WORKFLOW_DISPATCH, ref=tag)
+        add(StepKind.WORKFLOW_WAIT, ref=tag)
+        add(StepKind.PYPI_POLL, version=pkg.new_version)
     return steps
 
 
@@ -726,6 +822,7 @@ def generate_plan(
     upgrade_pinned: bool = False,
     pr_specs: PrSpecs | None = None,
     prerelease: bool = False,
+    target: str = "pypi",
 ) -> Plan:
     """Build the full, serialisable release plan for *chain*.
 
@@ -788,7 +885,7 @@ def generate_plan(
             sibling_deps=sibling_deps,
         )
         packages.append(pkg)
-        all_steps.extend(plan_steps(pkg, org, fork, release_name))
+        all_steps.extend(plan_steps(pkg, org, fork, release_name, target))
         if new_ver:
             released[repo] = new_ver
 
@@ -799,6 +896,7 @@ def generate_plan(
         gh_fork=fork,
         release_name=release_name,
         prerelease=prerelease,
+        target=target,
     )
 
 
@@ -1007,6 +1105,27 @@ def execute_step(step: Step, plan: Plan, ctx: Ctx):
 
         case StepKind.WHEEL_POLL:
             wait_for_wheel(step.package, p["version"], plan.gh_org, ctx.wheel_timeout)
+
+        case StepKind.WORKFLOW_DISPATCH:
+            sh(
+                "gh", "workflow", "run", "publish.yml",
+                "--repo", gh_repo,
+                "--ref", p["ref"],
+                "-f", f"target={plan.target}",
+            )  # fmt: skip
+
+        case StepKind.WORKFLOW_WAIT:
+            event = "workflow_dispatch" if plan.target == "testpypi" else "push"
+            run_id = _find_publish_run(gh_repo, p["ref"], event)
+            sh(
+                "gh", "run", "watch", run_id,
+                "--repo", gh_repo,
+                "--exit-status",
+            )  # fmt: skip
+            step.result["run_id"] = run_id
+
+        case StepKind.PYPI_POLL:
+            wait_for_pypi(step.package, p["version"], plan.target, ctx.pypi_timeout)
 
 
 def simulate_step(step: Step, plan: Plan, ctx: Ctx):
@@ -1321,6 +1440,12 @@ _chain_options = _stack(
         is_flag=True,
         help="Publish as a GitHub prerelease (hidden from the repo's 'Latest' badge)",
     ),
+    click.option(
+        "--target",
+        default="pypi",
+        type=click.Choice(["pypi", "testpypi"]),
+        help="PyPI publish target (pypi=production, testpypi=dry-run)",
+    ),
     _remote_options,
 )
 """Chain-spec positional + planner options shared by ``quick`` and ``plan``."""
@@ -1346,6 +1471,7 @@ def quick(
     upgrade_pinned,
     open_top,
     prerelease,
+    target,
     org,
     fork,
     cache_dir,
@@ -1405,6 +1531,7 @@ def quick(
         upgrade_pinned=upgrade_pinned,
         pr_specs=pr_specs,
         prerelease=prerelease,
+        target=target,
     )
 
     _render_plan_preview(plan)
@@ -1553,6 +1680,7 @@ def plan_cmd(
     upgrade_pinned,
     open_top,
     prerelease,
+    target,
     org,
     fork,
     cache_dir,
@@ -1589,6 +1717,7 @@ def plan_cmd(
         upgrade_pinned=upgrade_pinned,
         pr_specs=pr_specs,
         prerelease=prerelease,
+        target=target,
     )
 
     out = Path(output) if output else cd / "plans" / f"{datetime.now():%Y%m%d-%H%M%S}.json"
