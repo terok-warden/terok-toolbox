@@ -1,0 +1,47 @@
+#!/bin/bash
+# SPDX-FileCopyrightText: 2026 Jiri Vyskocil
+# SPDX-License-Identifier: Apache-2.0
+#
+# Persistent warden release-officer container, managed by distrobox.
+#
+# Created once with `--unshare-all` so the host SSH agent, D-Bus
+# session, and personal $HOME stay outside its view; subsequent
+# invocations are fast `podman exec`s into the running container.
+#
+# Usage:
+#   warden                       # interactive shell
+#   warden <cmd> [args...]       # run a command directly
+#     e.g. warden terok-release plan sandbox..terok
+#          warden gh auth status
+#   WARDEN_REBUILD=1 warden      # recreate the container
+
+set -euo pipefail
+
+CONTAINER=warden
+ROOT="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+HOME_DIR="${WARDEN_HOME:-$HOME/warden/home}"
+IMAGE="${WARDEN_IMAGE:-registry.fedoraproject.org/fedora-toolbox:44}"
+PACKAGES="gh poetry python3-click python3-tomlkit python3-pydantic python3-rich"
+
+if [ "${WARDEN_REBUILD:-0}" = "1" ]; then
+    distrobox rm -f "$CONTAINER" 2>/dev/null || true
+fi
+
+if ! podman container exists "$CONTAINER"; then
+    mkdir -p "$HOME_DIR"
+    distrobox create \
+        --name "$CONTAINER" \
+        --image "$IMAGE" \
+        --home "$HOME_DIR" \
+        --unshare-all \
+        --volume "$ROOT:/toolbox" \
+        --additional-packages "$PACKAGES" \
+        --init-hooks "ln -sf /toolbox/scripts/terok-release-chain.py /usr/local/bin/terok-release" \
+        --yes
+fi
+
+if [ $# -eq 0 ]; then
+    exec distrobox enter "$CONTAINER"
+else
+    exec distrobox enter "$CONTAINER" -- "$@"
+fi
