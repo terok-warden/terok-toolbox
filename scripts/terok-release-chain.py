@@ -106,7 +106,7 @@ WHEEL_HEAD_TIMEOUT = 10  # per HEAD probe of the actual download URL
 PYPI_POLL_INTERVAL = 5
 PYPI_HTTP_TIMEOUT = 10
 WORKFLOW_DISCOVERY_POLL_INTERVAL = 2
-WORKFLOW_DISCOVERY_TIMEOUT = 60  # seconds to wait for the publish.yml run to register
+WORKFLOW_DISCOVERY_TIMEOUT = 60  # seconds to wait for the release.yml run to register
 
 MERGE_RACE_POLL_COUNT = 15
 MERGE_RACE_POLL_INTERVAL = 2
@@ -258,12 +258,19 @@ class Plan(BaseModel):
     downstream packages need to pin against, without promoting it to the
     public release pointer."""
     target: str = "pypi"
-    """Where each release publishes its Python wheel: ``"pypi"`` (the default
-    production path — tag push auto-triggers ``publish.yml`` and lands on
-    PyPI) or ``"testpypi"`` (the dry-run path — chain script dispatches
-    ``publish.yml`` with ``target=testpypi`` so the publish job routes to
-    TestPyPI instead).  Either way the chain still cuts the GitHub Release
-    and writes the GH release wheel for legacy URL pins."""
+    """Where each release publishes its Python wheel:
+
+    - ``"pypi"`` — production. Tag push auto-triggers ``release.yml`` and
+      its ``pypi-publish`` job lands the wheel on PyPI.
+    - ``"testpypi"`` — first-release validation per package (or occasional
+      workflow-change dry-runs). Chain script dispatches ``release.yml``
+      with ``target=testpypi`` so the ``testpypi-publish`` job routes the
+      wheel to TestPyPI instead.
+    - ``"gh-only"`` — GitHub Release without any PyPI publish. For
+      non-PyPI projects or release candidates that should not hit any
+      index. Chain script dispatches with ``target=gh-only``.
+
+    Either way the GitHub Release is created with the wheel attached."""
     created_at: str = Field(default_factory=lambda: datetime.now(UTC).isoformat())
 
 
@@ -656,20 +663,21 @@ def wait_for_wheel(repo: str, version: str, org: str, timeout: int = DEFAULT_WHE
 # ── PyPI / Trusted-Publishing helpers ─────────────────────────────────────
 
 
-def _find_publish_run(gh_repo: str, ref: str, event: str) -> str:
-    """Return the most recent ``publish.yml`` run for *ref* fired by *event*.
+def _find_release_run(gh_repo: str, ref: str, event: str) -> str:
+    """Return the most recent ``release.yml`` run for *ref* fired by *event*.
 
     Polls briefly because the run takes a moment to register after a
     tag push (auto-trigger) or ``gh workflow run`` (dispatch). ``ref``
     is the tag name without the ``refs/tags/`` prefix; ``event`` is one
     of ``"push"`` (for ``target=pypi`` — auto-triggered run) or
-    ``"workflow_dispatch"`` (for ``target=testpypi`` — script-dispatched).
+    ``"workflow_dispatch"`` (for ``target=testpypi`` or ``target=gh-only``
+    — script-dispatched).
     """
     for _ in range(0, WORKFLOW_DISCOVERY_TIMEOUT, WORKFLOW_DISCOVERY_POLL_INTERVAL):
         r = sh(
             "gh", "run", "list",
             "--repo", gh_repo,
-            "--workflow", "publish.yml",
+            "--workflow", "release.yml",
             "--event", event,
             "--branch", ref,            # head_branch == tag for both events
             "--limit", "1",
@@ -681,7 +689,7 @@ def _find_publish_run(gh_repo: str, ref: str, event: str) -> str:
             if runs:
                 return str(runs[0]["databaseId"])
         time.sleep(WORKFLOW_DISCOVERY_POLL_INTERVAL)
-    die(f"No publish.yml run found for {gh_repo} ref {ref} (event={event})")
+    die(f"No release.yml run found for {gh_repo} ref {ref} (event={event})")
 
 
 def wait_for_pypi(repo: str, version: str, target: str, timeout: int) -> None:
@@ -772,14 +780,15 @@ def plan_steps(pkg: PackagePlan, org: str, fork: str, name: str, target: str) ->
         add(StepKind.TAG, tag=tag, title=title)
         add(StepKind.RELEASE, tag=tag, title=title)
         add(StepKind.WHEEL_POLL, version=pkg.new_version)
-        # PyPI publication. ``target=pypi`` rides the auto-trigger from the
-        # tag push that just happened in TAG; ``target=testpypi`` overrides
-        # by dispatching publish.yml so the workflow's target input lands on
-        # TestPyPI instead of the auto-trigger's PyPI default.
-        if target == "testpypi":
+        # ``target=pypi`` rides the auto-trigger from the tag push for
+        # ``pypi-publish``; ``target=testpypi`` and ``target=gh-only``
+        # override by dispatching release.yml so the workflow's ``target``
+        # input routes to the testpypi-publish job or skips publish entirely.
+        if target in ("testpypi", "gh-only"):
             add(StepKind.WORKFLOW_DISPATCH, ref=tag)
         add(StepKind.WORKFLOW_WAIT, ref=tag)
-        add(StepKind.PYPI_POLL, version=pkg.new_version)
+        if target != "gh-only":
+            add(StepKind.PYPI_POLL, version=pkg.new_version)
     return steps
 
 
@@ -1108,15 +1117,18 @@ def execute_step(step: Step, plan: Plan, ctx: Ctx):
 
         case StepKind.WORKFLOW_DISPATCH:
             sh(
-                "gh", "workflow", "run", "publish.yml",
+                "gh", "workflow", "run", "release.yml",
                 "--repo", gh_repo,
                 "--ref", p["ref"],
                 "-f", f"target={plan.target}",
             )  # fmt: skip
 
         case StepKind.WORKFLOW_WAIT:
-            event = "workflow_dispatch" if plan.target == "testpypi" else "push"
-            run_id = _find_publish_run(gh_repo, p["ref"], event)
+            # ``target=pypi`` rides the auto-trigger from tag push (event=push).
+            # ``target=testpypi`` and ``target=gh-only`` were explicitly
+            # dispatched by WORKFLOW_DISPATCH (event=workflow_dispatch).
+            event = "push" if plan.target == "pypi" else "workflow_dispatch"
+            run_id = _find_release_run(gh_repo, p["ref"], event)
             sh(
                 "gh", "run", "watch", run_id,
                 "--repo", gh_repo,
@@ -1447,8 +1459,8 @@ _chain_options = _stack(
     click.option(
         "--target",
         default="pypi",
-        type=click.Choice(["pypi", "testpypi"]),
-        help="PyPI publish target (pypi=production, testpypi=dry-run)",
+        type=click.Choice(["pypi", "testpypi", "gh-only"]),
+        help="Publish target — pypi (production), testpypi (validation), gh-only (no PyPI)",
     ),
     _remote_options,
 )
