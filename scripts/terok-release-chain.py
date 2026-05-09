@@ -1214,6 +1214,10 @@ def execute_plan(plan: Plan, *, mode: ExecMode, ctx: Ctx) -> Plan:
                 step.result["error"] = str(exc)
                 if ctx.plan_path:
                     save_plan(plan, ctx.plan_path)
+                    console.print(f"[red]Plan state saved:[/] {ctx.plan_path}")
+                    console.print(
+                        f"[red]Resume with: terok-release execute {ctx.plan_path}[/]"
+                    )
                 pkg = _package(plan, step.package)
                 if pkg.pr_url:
                     console.print(f"[red]Step operated on:[/] {pkg.pr_url}")
@@ -1545,7 +1549,8 @@ def quick(
     plan_path = cd / "plans" / f"{ts}-{slug}.json"
     ctx.plan_path = plan_path
     save_plan(plan, plan_path)
-    console.print(f"\nPlan saved: {plan_path}")
+    console.print(f"\n[bold]Plan saved:[/] {plan_path}")
+    console.print(f"[dim]Resume on failure: terok-release execute {plan_path}[/]")
 
     # Execute
     mode = ExecMode.SIMULATE if pretend else ExecMode.EXECUTE
