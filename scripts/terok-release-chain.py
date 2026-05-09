@@ -702,23 +702,31 @@ def _find_release_run(gh_repo: str, ref: str, event: str) -> str:
     die(f"No release.yml run found for {gh_repo} ref {ref} (event={event})")
 
 
-def wait_for_release_run(gh_repo: str, run_id: str, ctx: "Ctx") -> None:
+def wait_for_release_run(gh_repo: str, run_id: str, ref: str, ctx: "Ctx") -> None:
     """Watch a ``release.yml`` run, alerting when it pauses for approval.
 
     GitHub's deployment-protection rules (required reviewers on the
     ``pypi`` environment) park the run in ``waiting`` status until
     approved.  ``gh run watch`` itself shows that state but doesn't
     pull the operator's attention to it; this wrapper does — bell +
-    banner with the approval URL — then hands off to ``gh run watch``
-    once the run is no longer waiting.  Honors ``ctx.dry_run`` and
-    ``ctx.auto_yes`` to stay silent when not interactive.
+    banner with both the approval URL *and* the GH release URL.
+
+    The waiting state is the natural moment to edit the auto-generated
+    release notes: github-release has already completed by then and
+    created the release with default notes.  Surfacing the release-
+    edit URL alongside the approval URL turns "waiting for approval"
+    into a deliberate review-and-edit-and-approve checkpoint per
+    package — exactly what publishing to PyPI deserves.
+
+    Honors ``ctx.dry_run`` to stay silent when not interactive.
     """
     if ctx.dry_run:
         console.print(f"[yellow][pretend][/] Would watch run {run_id} on {gh_repo}")
         return
 
     alerted = False
-    poll_url = f"https://github.com/{gh_repo}/actions/runs/{run_id}"
+    approval_url = f"https://github.com/{gh_repo}/actions/runs/{run_id}"
+    release_url = f"https://github.com/{gh_repo}/releases/edit/{ref}"
     while True:
         r = sh(
             "gh", "run", "view", run_id,
@@ -733,8 +741,9 @@ def wait_for_release_run(gh_repo: str, run_id: str, ctx: "Ctx") -> None:
         if info["status"] == "waiting" and not alerted:
             console.bell()
             console.print(
-                f"\n[black on bright_yellow] APPROVAL NEEDED [/]  "
-                f"{gh_repo}: {poll_url}"
+                f"\n[black on bright_yellow] APPROVAL NEEDED [/]  {gh_repo}\n"
+                f"  [bold]Edit release notes:[/] {release_url}\n"
+                f"  [bold]Approve PyPI publish:[/] {approval_url}"
             )
             alerted = True
         # ``completed`` is the terminal status; everything else means
@@ -1190,7 +1199,7 @@ def execute_step(step: Step, plan: Plan, ctx: Ctx):
             event = "push" if plan.target == "pypi" else "workflow_dispatch"
             run_id = _find_release_run(gh_repo, p["ref"], event)
             step.result["run_id"] = run_id
-            wait_for_release_run(gh_repo, run_id, ctx)
+            wait_for_release_run(gh_repo, run_id, p["ref"], ctx)
 
         case StepKind.PYPI_POLL:
             wait_for_pypi(step.package, p["version"], plan.target, ctx.pypi_timeout)
