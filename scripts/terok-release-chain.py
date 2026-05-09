@@ -1414,7 +1414,12 @@ def _downstream_closure(explicit: list[str], graph: DepGraph) -> list[str]:
 def _render_plan_preview(plan: Plan) -> None:
     """Print the plan as a table — the operator's last look before we commit."""
     kind_hint = "[yellow]prerelease[/]" if plan.prerelease else "[green]release[/]"
-    console.print(f"\n[bold]Release plan ({kind_hint}):[/]\n")
+    target_hint = {
+        "pypi": "[bold red]→ PyPI (production)[/]",
+        "testpypi": "[bold yellow]→ TestPyPI (validation)[/]",
+        "gh-only": "[dim]→ GitHub Release only (no PyPI)[/]",
+    }.get(plan.target, plan.target)
+    console.print(f"\n[bold]Release plan ({kind_hint}) {target_hint}:[/]\n")
     table = Table(show_header=True, header_style="bold")
     table.add_column("#", width=3)
     table.add_column("Package", style="cyan")
