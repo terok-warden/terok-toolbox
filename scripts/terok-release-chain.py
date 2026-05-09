@@ -15,15 +15,25 @@ Chain spec grammar (positional arg to ``quick`` and ``plan``):
                      pyproject pin to a released package needs bumping)
     A,B:NUM..C       any combination
 
+Publish targets (``--target``):
+    pypi             production — auto-triggered ``release.yml`` lands the
+                     wheel on PyPI after tag push (default)
+    testpypi         first-release validation per package, or occasional
+                     workflow-change dry-run; chain script dispatches
+                     ``release.yml`` with target=testpypi to publish to
+                     TestPyPI instead
+    gh-only          GitHub Release only, no PyPI/TestPyPI
+
 Usage:
-    python3 tools/terok-release-chain.py quick sandbox
-    python3 tools/terok-release-chain.py quick sandbox..terok --open-top
-    python3 tools/terok-release-chain.py quick sandbox:42,executor:55,terok:706 --open-top
-    python3 tools/terok-release-chain.py quick clearance,sandbox:221..terok
-    python3 tools/terok-release-chain.py open feat/comms clearance
-    python3 tools/terok-release-chain.py plan sandbox..terok -o plan.json
-    python3 tools/terok-release-chain.py simulate plan.json
-    python3 tools/terok-release-chain.py execute plan.json
+    terok-release quick sandbox
+    terok-release quick sandbox..terok --open-top
+    terok-release quick sandbox:42,executor:55,terok:706 --open-top
+    terok-release quick clearance,sandbox:221..terok
+    terok-release quick mkdocs --target=testpypi
+    terok-release open feat/comms clearance
+    terok-release plan sandbox..terok -o plan.json
+    terok-release simulate plan.json
+    terok-release execute plan.json
 """
 
 from __future__ import annotations
