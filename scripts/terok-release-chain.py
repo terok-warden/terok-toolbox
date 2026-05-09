@@ -692,6 +692,56 @@ def _find_release_run(gh_repo: str, ref: str, event: str) -> str:
     die(f"No release.yml run found for {gh_repo} ref {ref} (event={event})")
 
 
+def wait_for_release_run(gh_repo: str, run_id: str, ctx: "Ctx") -> None:
+    """Watch a ``release.yml`` run, alerting when it pauses for approval.
+
+    GitHub's deployment-protection rules (required reviewers on the
+    ``pypi`` environment) park the run in ``waiting`` status until
+    approved.  ``gh run watch`` itself shows that state but doesn't
+    pull the operator's attention to it; this wrapper does — bell +
+    banner with the approval URL — then hands off to ``gh run watch``
+    once the run is no longer waiting.  Honors ``ctx.dry_run`` and
+    ``ctx.auto_yes`` to stay silent when not interactive.
+    """
+    if ctx.dry_run:
+        console.print(f"[yellow][pretend][/] Would watch run {run_id} on {gh_repo}")
+        return
+
+    alerted = False
+    poll_url = f"https://github.com/{gh_repo}/actions/runs/{run_id}"
+    while True:
+        r = sh(
+            "gh", "run", "view", run_id,
+            "--repo", gh_repo,
+            "--json", "status,conclusion",
+            capture=True, check=False,
+        )  # fmt: skip
+        if r.returncode != 0 or not r.stdout.strip():
+            time.sleep(2)
+            continue
+        info = json.loads(r.stdout)
+        if info["status"] == "waiting" and not alerted:
+            console.bell()
+            console.print(
+                f"\n[black on bright_yellow] APPROVAL NEEDED [/]  "
+                f"{gh_repo}: {poll_url}"
+            )
+            alerted = True
+        # ``completed`` is the terminal status; everything else means
+        # "in flight" — including ``waiting`` (deployment review),
+        # ``in_progress``, ``queued``.  Hand off to ``gh run watch``
+        # once we're no longer waiting; it streams the rest.
+        if info["status"] != "waiting":
+            break
+        time.sleep(WORKFLOW_DISCOVERY_POLL_INTERVAL)
+
+    sh(
+        "gh", "run", "watch", run_id,
+        "--repo", gh_repo,
+        "--exit-status",
+    )  # fmt: skip
+
+
 def wait_for_pypi(repo: str, version: str, target: str, timeout: int) -> None:
     """Block until *repo*-*version* resolves on the chosen index.
 
@@ -1129,12 +1179,8 @@ def execute_step(step: Step, plan: Plan, ctx: Ctx):
             # dispatched by WORKFLOW_DISPATCH (event=workflow_dispatch).
             event = "push" if plan.target == "pypi" else "workflow_dispatch"
             run_id = _find_release_run(gh_repo, p["ref"], event)
-            sh(
-                "gh", "run", "watch", run_id,
-                "--repo", gh_repo,
-                "--exit-status",
-            )  # fmt: skip
             step.result["run_id"] = run_id
+            wait_for_release_run(gh_repo, run_id, ctx)
 
         case StepKind.PYPI_POLL:
             wait_for_pypi(step.package, p["version"], plan.target, ctx.pypi_timeout)
