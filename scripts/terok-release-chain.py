@@ -1208,7 +1208,15 @@ def execute_step(step: Step, plan: Plan, ctx: Ctx):
             if r.returncode == 0:
                 console.print(f"[dim]Tag {p['tag']} already exists — skipping.[/]")
             else:
-                sh("git", "tag", "-f", p["tag"], target, cwd=repo_dir)
+                # ``-a`` for an annotated tag (-m without -a would be ignored
+                # for lightweight tags); operators with ``tag.gpgSign = true``
+                # also get a signed annotated tag with this message instead
+                # of having git pop an editor for them to fill in by hand.
+                message = p.get("title") or p["tag"]
+                sh(
+                    "git", "tag", "-af", p["tag"], "-m", message, target,
+                    cwd=repo_dir,
+                )  # fmt: skip
                 sh("git", "push", "upstream", p["tag"], cwd=repo_dir)
 
         case StepKind.RELEASE:
