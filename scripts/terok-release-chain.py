@@ -185,6 +185,20 @@ def wheel_url(org: str, repo: str, version: str) -> str:
     )
 
 
+def published_url(target: str, org: str, repo: str, version: str) -> str:
+    """URL of the just-released package, for the end-of-run summary.
+
+    For ``pypi`` / ``testpypi`` targets the project page on the chosen
+    index; for ``gh-only`` the GitHub Release page (no PyPI artifact
+    was created).
+    """
+    if target == "testpypi":
+        return f"https://test.pypi.org/project/{repo}/{version}/"
+    if target == "pypi":
+        return f"https://pypi.org/project/{repo}/{version}/"
+    return f"https://github.com/{org}/{repo}/releases/tag/v{version}"
+
+
 # ── Domain types ──────────────────────────────────────────────────────────
 
 # Package → in-chain packages it depends on.
@@ -1799,7 +1813,10 @@ def quick(
     console.print(f"\n{prefix}[bold green]All releases complete![/]\n")
     for pkg in plan.packages:
         if pkg.new_version:
-            console.print(f"  [green]*[/] {pkg.repo} v{pkg.new_version}")
+            url = published_url(plan.target, plan.gh_org, pkg.repo, pkg.new_version)
+            console.print(
+                f"  [green]*[/] {pkg.repo} v{pkg.new_version}  [dim]{url}[/]"
+            )
         else:
             url_suffix = f" → {pkg.pr_url}" if pkg.pr_url else ""
             console.print(f"  [yellow]*[/] {pkg.repo}  (deps only){url_suffix}")
