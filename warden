@@ -40,6 +40,15 @@ if ! podman container exists "$CONTAINER"; then
         --yes
 fi
 
+# Strip the host's SSH agent socket before entering the container —
+# distrobox (even with --unshare-all) bind-mounts /run/user/$UID, which
+# carries the host's ssh-agent socket.  Without this, ``git push`` over
+# SSH inside the container would silently use the host user's keys via
+# that agent and attribute pushes to the host user instead of
+# terok-warden.  The container instead uses its own ~/.ssh/id_ed25519
+# (set up once via ``warden ssh-keygen`` — see README).
+unset SSH_AUTH_SOCK
+
 if [ $# -eq 0 ]; then
     exec distrobox enter "$CONTAINER"
 else
