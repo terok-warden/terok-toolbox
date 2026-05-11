@@ -281,6 +281,19 @@ class Plan(BaseModel):
       index. Chain script dispatches with ``target=gh-only``.
 
     Either way the GitHub Release is created with the wheel attached."""
+    pin_style: str = "pypi"
+    """How sibling deps are pinned in the released wheel's pyproject:
+
+    - ``"pypi"`` — version specifier (``terok-shield = "^0.6.38"``).
+      The default for ``pypi``/``testpypi`` targets — consumers
+      resolve siblings via the published index.
+    - ``"url"`` — GH release wheel URL (``terok-shield = { url = "..." }``).
+      The default for ``gh-only`` — consumers need the GH release wheel
+      to install, since nothing went to PyPI.
+
+    PyPI rejects uploads with direct-URL deps, so ``pin_style=url`` is
+    incompatible with ``target ∈ {pypi, testpypi}`` and the planner
+    refuses the combination."""
     created_at: str = Field(default_factory=lambda: datetime.now(UTC).isoformat())
 
 
@@ -345,6 +358,23 @@ def set_dep_url(path: Path, dep_repo: str, version: str, org: str):
     t = tomlkit.inline_table()
     t.append("url", wheel_url(org, dep_repo, version))
     deps[key] = t
+    path.write_text(tomlkit.dumps(doc))
+
+
+def set_dep_pypi(path: Path, dep_repo: str, version: str):
+    """Set a dependency to a PyPI version specifier (Poetry caret form).
+
+    ``terok-shield = "^0.6.38"`` resolves to >=0.6.38, <1.0.0 (Poetry's
+    caret semantics; for the 0.x range this is equivalent to PEP 440's
+    minor-pinning tilde-release).  Operators wanting strict ``==`` pins
+    can swap the leading ``^`` manually; the chain script doesn't try
+    to second-guess that decision per release.
+    """
+    doc, deps = _toml_deps(path)
+    key = dep_repo if dep_repo in deps else pkg_name(dep_repo)
+    if key not in deps:
+        return
+    deps[key] = f"^{version}"
     path.write_text(tomlkit.dumps(doc))
 
 
@@ -807,7 +837,9 @@ def _branch_for(pkg: PackagePlan, release_name: str) -> str:
     return f"{BUMP_DEPS_BRANCH_PREFIX}{'-' + suffix if suffix else ''}"
 
 
-def plan_steps(pkg: PackagePlan, org: str, fork: str, name: str, target: str) -> list[Step]:
+def plan_steps(
+    pkg: PackagePlan, org: str, fork: str, name: str, target: str, pin_style: str
+) -> list[Step]:
     """Linear step sequence that realises one package's work in the plan."""
     do_release = pkg.action in (Action.RELEASE_MASTER, Action.RELEASE_PR)
     needs_new_pr = pkg.action == Action.RELEASE_MASTER or (
@@ -830,7 +862,7 @@ def plan_steps(pkg: PackagePlan, org: str, fork: str, name: str, target: str) ->
         **({"source": "pr"} if pkg.pr_branch else {"base": "upstream/master"}),
     )
     for dep, ver in pkg.sibling_deps.items():
-        add(StepKind.DEP_UPDATE, dep_repo=dep, dep_version=ver)
+        add(StepKind.DEP_UPDATE, dep_repo=dep, dep_version=ver, pin_style=pin_style)
     if do_release:
         add(StepKind.VERSION_BUMP, version=pkg.new_version)
     add(StepKind.POETRY_LOCK)
@@ -901,6 +933,7 @@ def generate_plan(
     pr_specs: PrSpecs | None = None,
     prerelease: bool = False,
     target: str = "pypi",
+    pin_style: str = "pypi",
 ) -> Plan:
     """Build the full, serialisable release plan for *chain*.
 
@@ -963,7 +996,7 @@ def generate_plan(
             sibling_deps=sibling_deps,
         )
         packages.append(pkg)
-        all_steps.extend(plan_steps(pkg, org, fork, release_name, target))
+        all_steps.extend(plan_steps(pkg, org, fork, release_name, target, pin_style))
         if new_ver:
             released[repo] = new_ver
 
@@ -975,6 +1008,7 @@ def generate_plan(
         release_name=release_name,
         prerelease=prerelease,
         target=target,
+        pin_style=pin_style,
     )
 
 
@@ -1046,7 +1080,16 @@ def execute_step(step: Step, plan: Plan, ctx: Ctx):
             set_version_toml(repo_dir / "pyproject.toml", p["version"])
 
         case StepKind.DEP_UPDATE:
-            set_dep_url(repo_dir / "pyproject.toml", p["dep_repo"], p["dep_version"], plan.gh_org)
+            # Plans generated before the pin-style flag landed don't carry
+            # the parameter — fall back to the plan-level setting (which
+            # defaults to ``"pypi"`` for the same reason).
+            pin_style = p.get("pin_style", plan.pin_style)
+            if pin_style == "url":
+                set_dep_url(
+                    repo_dir / "pyproject.toml", p["dep_repo"], p["dep_version"], plan.gh_org
+                )
+            else:
+                set_dep_pypi(repo_dir / "pyproject.toml", p["dep_repo"], p["dep_version"])
 
         case StepKind.POETRY_LOCK:
             sh("poetry", "lock", cwd=repo_dir)
@@ -1438,7 +1481,10 @@ def _render_plan_preview(plan: Plan) -> None:
         "testpypi": "[bold yellow]→ TestPyPI (validation)[/]",
         "gh-only": "[dim]→ GitHub Release only (no PyPI)[/]",
     }.get(plan.target, plan.target)
-    console.print(f"\n[bold]Release plan ({kind_hint}) {target_hint}:[/]\n")
+    pin_hint = (
+        "[dim]url-pin deps[/]" if plan.pin_style == "url" else "[dim]pypi-pin deps[/]"
+    )
+    console.print(f"\n[bold]Release plan ({kind_hint}) {target_hint} {pin_hint}:[/]\n")
     table = Table(show_header=True, header_style="bold")
     table.add_column("#", width=3)
     table.add_column("Package", style="cyan")
@@ -1532,9 +1578,36 @@ _chain_options = _stack(
         type=click.Choice(["pypi", "testpypi", "gh-only"]),
         help="Publish target — pypi (production), testpypi (validation), gh-only (no PyPI)",
     ),
+    click.option(
+        "--pin-style",
+        default=None,
+        type=click.Choice(["pypi", "url"]),
+        help=(
+            "Sibling dep pin style. Default is 'pypi' (version specifiers) for "
+            "pypi/testpypi targets, 'url' (GH release wheel URLs) for gh-only."
+        ),
+    ),
     _remote_options,
 )
 """Chain-spec positional + planner options shared by ``quick`` and ``plan``."""
+
+
+def _resolve_pin_style(pin_style: str | None, target: str) -> str:
+    """Pick the right pin style for the target if the operator didn't override.
+
+    PyPI rejects uploads with direct-URL deps, so ``pin_style=url`` is
+    incompatible with the ``pypi``/``testpypi`` targets — fail fast on
+    that combination rather than building a wheel PyPI will reject.
+    """
+    if pin_style is None:
+        pin_style = "url" if target == "gh-only" else "pypi"
+    if pin_style == "url" and target in ("pypi", "testpypi"):
+        die(
+            f"--pin-style=url is incompatible with --target={target} — PyPI "
+            "rejects uploads with direct-URL deps. Use --pin-style=pypi or "
+            "switch to --target=gh-only."
+        )
+    return pin_style
 
 
 @click.group(context_settings=_CLICK_CONTEXT)
@@ -1558,6 +1631,7 @@ def quick(
     open_top,
     prerelease,
     target,
+    pin_style,
     org,
     fork,
     cache_dir,
@@ -1604,6 +1678,7 @@ def quick(
 
     chain, stop_at, pr_specs = _resolve_chain(chain_spec, live_deps, open_top=open_top)
 
+    pin_style = _resolve_pin_style(pin_style, target)
     plan = generate_plan(
         chain,
         live_deps,
@@ -1618,6 +1693,7 @@ def quick(
         pr_specs=pr_specs,
         prerelease=prerelease,
         target=target,
+        pin_style=pin_style,
     )
 
     _render_plan_preview(plan)
@@ -1768,6 +1844,7 @@ def plan_cmd(
     open_top,
     prerelease,
     target,
+    pin_style,
     org,
     fork,
     cache_dir,
@@ -1791,6 +1868,7 @@ def plan_cmd(
 
     chain, stop_at, pr_specs = _resolve_chain(chain_spec, live_deps, open_top=open_top)
 
+    pin_style = _resolve_pin_style(pin_style, target)
     plan = generate_plan(
         chain,
         live_deps,
@@ -1805,6 +1883,7 @@ def plan_cmd(
         pr_specs=pr_specs,
         prerelease=prerelease,
         target=target,
+        pin_style=pin_style,
     )
 
     out = Path(output) if output else cd / "plans" / f"{datetime.now():%Y%m%d-%H%M%S}.json"
