@@ -33,6 +33,32 @@ The container's `$HOME` defaults to `~/warden/home` (override with
 container, so script edits on the host show up immediately — no rebuild
 needed for script changes.
 
+### Warden SSH key (required for `git push`)
+
+The wrapper strips `SSH_AUTH_SOCK` from the container's environment so the
+host's ssh-agent never leaks in — git pushes from inside warden would
+otherwise use the host user's keys and attribute the push to the wrong
+identity. The container then has no SSH keys at all by default; generate
+warden's own once:
+
+```bash
+warden ssh-keygen -t ed25519 -C "terok-warden" -f ~/.ssh/id_ed25519 -N ""
+warden cat ~/.ssh/id_ed25519.pub
+```
+
+Add the printed public key to `terok-warden`'s GitHub account:
+**<https://github.com/settings/keys>** (logged in as terok-warden) → New SSH
+key → "Authentication Key". The PAT scope used for `gh auth login` doesn't
+cover SSH key management, so this step goes through the web UI.
+
+Verify:
+
+```bash
+warden ssh -T git@github.com
+# Hi terok-warden! You've successfully authenticated, but GitHub does not
+# provide shell access.
+```
+
 ## Daily use
 
 ```bash
