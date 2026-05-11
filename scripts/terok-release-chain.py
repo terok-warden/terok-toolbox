@@ -452,11 +452,20 @@ def _verify_dep_graph(chain: list[str], cache_dir: Path) -> DepGraph:
 
 
 def ensure_clone(repo: str, cache_dir: Path, org: str, fork: str):
-    """Create or sync a repo clone in the release cache."""
+    """Create or sync a repo clone in the release cache.
+
+    Fetches with ``--tags --prune-tags`` so tags deleted on the remote
+    also disappear from the cache.  Otherwise stale local tags can
+    fool ``latest_version`` / dep-graph checks into thinking versions
+    still exist that have been yanked or rewritten upstream.
+    """
     repo_dir = cache_dir / repo
     if (repo_dir / ".git").is_dir():
         console.print(f"  [cyan]{repo:<16}[/] syncing...", end="\r")
-        sh("git", "fetch", "upstream", "--quiet", cwd=repo_dir)
+        sh(
+            "git", "fetch", "upstream", "--quiet", "--tags", "--prune-tags",
+            cwd=repo_dir,
+        )  # fmt: skip
         sh("git", "reset", "--hard", "upstream/master", "-q", cwd=repo_dir)
         sh("git", "clean", "-fd", "--quiet", cwd=repo_dir)
     else:
@@ -1190,7 +1199,7 @@ def execute_step(step: Step, plan: Plan, ctx: Ctx):
                 step.result["merge_sha"] = squash_merge(pr_url, gh_repo)
 
         case StepKind.TAG:
-            sh("git", "fetch", "upstream", cwd=repo_dir)
+            sh("git", "fetch", "upstream", "--tags", "--prune-tags", cwd=repo_dir)
             target = _merge_sha_for(step.package, plan) or "upstream/master"
             # Idempotent: skip if tag already exists on the expected target
             r = sh(
