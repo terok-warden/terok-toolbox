@@ -498,8 +498,15 @@ def ensure_clone(repo: str, cache_dir: Path, org: str, fork: str):
     still exist that have been yanked or rewritten upstream.
     """
     repo_dir = cache_dir / repo
+    upstream_url = f"git@github.com:{org}/{repo}.git"
+    fork_url = f"git@github.com:{fork}/{repo}.git"
     if (repo_dir / ".git").is_dir():
         console.print(f"  [cyan]{repo:<16}[/] syncing...", end="\r")
+        # Normalize remote URLs every sync in case the operator switched
+        # between fork-based and same-org workflows (eg. ``--fork`` flag
+        # changed) — saves a manual ``git remote set-url`` on each clone.
+        sh("git", "remote", "set-url", "upstream", upstream_url, cwd=repo_dir)
+        sh("git", "remote", "set-url", "origin", fork_url, cwd=repo_dir)
         sh(
             "git", "fetch", "upstream", "--quiet", "--tags", "--prune-tags", "--force",
             cwd=repo_dir,
@@ -508,9 +515,9 @@ def ensure_clone(repo: str, cache_dir: Path, org: str, fork: str):
         sh("git", "clean", "-fd", "--quiet", cwd=repo_dir)
     else:
         console.print(f"  [cyan]{repo:<16}[/] cloning...", end="\r")
-        sh("git", "clone", "--quiet", f"git@github.com:{org}/{repo}.git", str(repo_dir))
+        sh("git", "clone", "--quiet", upstream_url, str(repo_dir))
         sh("git", "remote", "rename", "origin", "upstream", cwd=repo_dir)
-        sh("git", "remote", "add", "origin", f"git@github.com:{fork}/{repo}.git", cwd=repo_dir)
+        sh("git", "remote", "add", "origin", fork_url, cwd=repo_dir)
     console.print(f"  [cyan]{repo:<16}[/] ready     ")
 
 
@@ -1452,11 +1459,14 @@ def _common_ctx(
     yes: bool,
     skip_checks: bool,
     check_timeout: int,
-    *,
-    require_fork: bool = True,
 ) -> tuple[str, str, Path, Ctx]:
-    if require_fork:
-        fork = fork or die("TEROK_GH_FORK is not set (e.g. TEROK_GH_FORK=sliwowitz)")
+    # When ``--fork`` (TEROK_GH_FORK) is unset, push release-prep branches
+    # directly to the org rather than to a personal fork.  This is what a
+    # release officer with write access on the org repo (terok-warden via
+    # release-officers team) wants — pushes are attributed to that account
+    # consistently, audit trail stays in one place, no fork to keep in sync.
+    if not fork:
+        fork = org
     cd = Path(cache_dir)
     cd.mkdir(parents=True, exist_ok=True)
     return (
@@ -1963,7 +1973,7 @@ def plan_cmd(
 @_remote_options
 def simulate(plan_file, org, fork, cache_dir):
     """Validate a plan against real repo state."""
-    org, fork, cd, ctx = _common_ctx(org, fork, cache_dir, True, True, True, 0, require_fork=False)
+    org, fork, cd, ctx = _common_ctx(org, fork, cache_dir, True, True, True, 0)
     plan = Plan.model_validate_json(Path(plan_file).read_text())
     # Fall back to plan-embedded values when CLI/env didn't provide them
     plan.gh_org = org or plan.gh_org
@@ -1981,12 +1991,12 @@ def simulate(plan_file, org, fork, cache_dir):
 def execute(plan_file, yes, skip_checks, check_timeout, org, fork, cache_dir):
     """Execute (or resume) a release plan."""
     org, fork, cd, ctx = _common_ctx(
-        org, fork, cache_dir, False, yes, skip_checks, check_timeout, require_fork=False
+        org, fork, cache_dir, False, yes, skip_checks, check_timeout
     )
     plan_path = Path(plan_file)
     plan = Plan.model_validate_json(plan_path.read_text())
     plan.gh_org = org or plan.gh_org
-    plan.gh_fork = fork or plan.gh_fork or die("Fork required: set TEROK_GH_FORK or embed in plan")
+    plan.gh_fork = fork or plan.gh_fork or plan.gh_org
     ctx.plan_path = plan_path
 
     has_completed = any(s.status == "completed" for s in plan.steps)
