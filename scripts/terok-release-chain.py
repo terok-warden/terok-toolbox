@@ -737,9 +737,11 @@ def wait_for_release_run(gh_repo: str, run_id: str, ref: str, ctx: "Ctx") -> Non
 
     GitHub's deployment-protection rules (required reviewers on the
     ``pypi`` environment) park the run in ``waiting`` status until
-    approved.  ``gh run watch`` itself shows that state but doesn't
-    pull the operator's attention to it; this wrapper does — bell +
-    banner with both the approval URL *and* the GH release URL.
+    approved.  This wrapper polls run status in a plain stdout loop
+    (no separate TUI mode, no ``gh run watch`` — Ctrl+C in this loop
+    just stops the script, it does not cancel the workflow run), and
+    on the first ``waiting`` observation rings the bell + prints a
+    banner with both the approval URL *and* the GH release-edit URL.
 
     The waiting state is the natural moment to edit the auto-generated
     release notes: github-release has already completed by then and
@@ -755,8 +757,11 @@ def wait_for_release_run(gh_repo: str, run_id: str, ref: str, ctx: "Ctx") -> Non
         return
 
     alerted = False
+    last_status: str | None = None
     approval_url = f"https://github.com/{gh_repo}/actions/runs/{run_id}"
     release_url = f"https://github.com/{gh_repo}/releases/edit/{ref}"
+    console.print(f"Watching run {run_id} ({approval_url})...")
+
     while True:
         r = sh(
             "gh", "run", "view", run_id,
@@ -765,30 +770,35 @@ def wait_for_release_run(gh_repo: str, run_id: str, ref: str, ctx: "Ctx") -> Non
             capture=True, check=False,
         )  # fmt: skip
         if r.returncode != 0 or not r.stdout.strip():
-            time.sleep(2)
+            time.sleep(WORKFLOW_DISCOVERY_POLL_INTERVAL)
             continue
         info = json.loads(r.stdout)
-        if info["status"] == "waiting" and not alerted:
+        status = info["status"]
+
+        # Log status transitions as plain lines — one per change, not per
+        # poll.  The polling loop stays in the regular CLI flow; no
+        # screen-clearing, no captured Ctrl+C.
+        if status != last_status:
+            console.print(f"  [dim]→ {status}[/]")
+            last_status = status
+
+        if status == "waiting" and not alerted:
             console.bell()
             console.print(
                 f"\n[black on bright_yellow] APPROVAL NEEDED [/]  {gh_repo}\n"
                 f"  [bold]Edit release notes:[/] {release_url}\n"
-                f"  [bold]Approve PyPI publish:[/] {approval_url}"
+                f"  [bold]Approve PyPI publish:[/] {approval_url}\n"
             )
             alerted = True
-        # ``completed`` is the terminal status; everything else means
-        # "in flight" — including ``waiting`` (deployment review),
-        # ``in_progress``, ``queued``.  Hand off to ``gh run watch``
-        # once we're no longer waiting; it streams the rest.
-        if info["status"] != "waiting":
-            break
-        time.sleep(WORKFLOW_DISCOVERY_POLL_INTERVAL)
 
-    sh(
-        "gh", "run", "watch", run_id,
-        "--repo", gh_repo,
-        "--exit-status",
-    )  # fmt: skip
+        if status == "completed":
+            conclusion = info.get("conclusion") or "?"
+            if conclusion == "success":
+                console.print(f"[green]Run completed: {conclusion}[/]")
+                return
+            die(f"Run ended with conclusion '{conclusion}' — see {approval_url}")
+
+        time.sleep(WORKFLOW_DISCOVERY_POLL_INTERVAL)
 
 
 def wait_for_pypi(repo: str, version: str, target: str, timeout: int) -> None:
@@ -881,14 +891,14 @@ def plan_steps(
         add(StepKind.TAG, tag=tag, title=title)
         add(StepKind.RELEASE, tag=tag, title=title)
         add(StepKind.WHEEL_POLL, version=pkg.new_version)
-        # ``target=pypi`` rides the auto-trigger from the tag push for
-        # ``pypi-publish``; ``target=testpypi`` and ``target=gh-only``
-        # override by dispatching release.yml so the workflow's ``target``
-        # input routes to the testpypi-publish job or skips publish entirely.
-        if target in ("testpypi", "gh-only"):
-            add(StepKind.WORKFLOW_DISPATCH, ref=tag)
-        add(StepKind.WORKFLOW_WAIT, ref=tag)
+        # The workflow's ``pypi-publish`` and ``testpypi-publish`` jobs are
+        # workflow_dispatch-only — tag push runs ``github-release`` and
+        # nothing else.  ``target=gh-only`` is therefore satisfied by the
+        # tag push alone (no dispatch needed); pypi/testpypi targets need
+        # an explicit dispatch to fire the publish job we want.
         if target != "gh-only":
+            add(StepKind.WORKFLOW_DISPATCH, ref=tag)
+            add(StepKind.WORKFLOW_WAIT, ref=tag)
             add(StepKind.PYPI_POLL, version=pkg.new_version)
     return steps
 
@@ -1236,11 +1246,10 @@ def execute_step(step: Step, plan: Plan, ctx: Ctx):
             )  # fmt: skip
 
         case StepKind.WORKFLOW_WAIT:
-            # ``target=pypi`` rides the auto-trigger from tag push (event=push).
-            # ``target=testpypi`` and ``target=gh-only`` were explicitly
-            # dispatched by WORKFLOW_DISPATCH (event=workflow_dispatch).
-            event = "push" if plan.target == "pypi" else "workflow_dispatch"
-            run_id = _find_release_run(gh_repo, p["ref"], event)
+            # The pypi-publish and testpypi-publish jobs are dispatched
+            # explicitly by the preceding WORKFLOW_DISPATCH step — we
+            # never wait on a push-triggered run for those jobs.
+            run_id = _find_release_run(gh_repo, p["ref"], "workflow_dispatch")
             step.result["run_id"] = run_id
             wait_for_release_run(gh_repo, run_id, p["ref"], ctx)
 
