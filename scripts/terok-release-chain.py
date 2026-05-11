@@ -38,10 +38,12 @@ Usage:
 
 from __future__ import annotations
 
+import io
 import json
 import os
 import re
 import subprocess
+import sys
 import time
 import urllib.request
 from collections.abc import Callable
@@ -320,14 +322,50 @@ class Ctx:
 def sh(
     *args: str, cwd: Path | None = None, capture: bool = False, check: bool = True
 ) -> subprocess.CompletedProcess[str]:
-    """Run a subprocess — always surfaces output on failure."""
-    r = subprocess.run(args, cwd=cwd, capture_output=capture, text=True, check=False)
+    """Run a subprocess — always surfaces stderr on failure.
+
+    With ``capture=False`` (default) stdout streams to the terminal and
+    stderr is tee'd: it's both displayed in real time *and* buffered so
+    the failure message can include it.  Previously stderr was inherited
+    from the parent process without buffering, so when an unattended
+    command failed the chain script reported "exit N" with no details
+    visible because the offending lines had been overwritten by Rich's
+    progress indicators or otherwise lost.
+
+    With ``capture=True`` both stdout and stderr are captured silently
+    and surfaced on failure (existing behaviour, unchanged).
+    """
+    if capture:
+        r = subprocess.run(args, cwd=cwd, capture_output=True, text=True, check=False)
+    else:
+        # Stream stderr through Python so we both display and buffer it.
+        proc = subprocess.Popen(args, cwd=cwd, stderr=subprocess.PIPE, text=True)
+        stderr_buf = io.StringIO()
+        try:
+            assert proc.stderr is not None
+            for line in proc.stderr:
+                sys.stderr.write(line)
+                sys.stderr.flush()
+                stderr_buf.write(line)
+        finally:
+            proc.wait()
+        r = subprocess.CompletedProcess(
+            args=proc.args,
+            returncode=proc.returncode,
+            stdout="",
+            stderr=stderr_buf.getvalue(),
+        )
+
     if check and r.returncode:
-        detail = (r.stderr or r.stdout or "").strip() if capture else ""
+        parts: list[str] = []
+        if r.stderr and r.stderr.strip():
+            parts.append(r.stderr.strip())
+        if r.stdout and r.stdout.strip():
+            parts.append(r.stdout.strip())
         cmd = " ".join(args)
         msg = f"Command failed (exit {r.returncode}): {cmd}"
-        if detail:
-            msg += f"\n{detail}"
+        if parts:
+            msg += "\n" + "\n".join(parts)
         die(msg)
     return r
 
@@ -463,7 +501,7 @@ def ensure_clone(repo: str, cache_dir: Path, org: str, fork: str):
     if (repo_dir / ".git").is_dir():
         console.print(f"  [cyan]{repo:<16}[/] syncing...", end="\r")
         sh(
-            "git", "fetch", "upstream", "--quiet", "--tags", "--prune-tags",
+            "git", "fetch", "upstream", "--quiet", "--tags", "--prune-tags", "--force",
             cwd=repo_dir,
         )  # fmt: skip
         sh("git", "reset", "--hard", "upstream/master", "-q", cwd=repo_dir)
@@ -1199,7 +1237,10 @@ def execute_step(step: Step, plan: Plan, ctx: Ctx):
                 step.result["merge_sha"] = squash_merge(pr_url, gh_repo)
 
         case StepKind.TAG:
-            sh("git", "fetch", "upstream", "--tags", "--prune-tags", cwd=repo_dir)
+            sh(
+                "git", "fetch", "upstream", "--tags", "--prune-tags", "--force",
+                cwd=repo_dir,
+            )  # fmt: skip
             target = _merge_sha_for(step.package, plan) or "upstream/master"
             # Idempotent: skip if tag already exists on the expected target
             r = sh(
