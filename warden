@@ -49,8 +49,17 @@ fi
 # (set up once via ``warden ssh-keygen`` — see README).
 unset SSH_AUTH_SOCK
 
+# Override the chain script's TEROK_GH_FORK inside the container so it
+# pushes release-prep branches to the org directly (where warden has
+# write access via the release-officers team) instead of inheriting
+# the host operator's personal-fork preference.  Operator can point
+# warden at a different fork by setting TEROK_WARDEN_GH_FORK on the
+# host; the chain script's --fork remains mandatory for callers
+# outside warden so a local run against a personal fork keeps working.
+EXTRA_FLAGS="-e TEROK_GH_FORK=${TEROK_WARDEN_GH_FORK:-terok-ai}"
+
 if [ $# -eq 0 ]; then
-    exec distrobox enter "$CONTAINER"
+    exec distrobox enter --additional-flags "$EXTRA_FLAGS" "$CONTAINER"
 else
-    exec distrobox enter "$CONTAINER" -- "$@"
+    exec distrobox enter --additional-flags "$EXTRA_FLAGS" "$CONTAINER" -- "$@"
 fi
