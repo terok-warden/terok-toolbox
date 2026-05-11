@@ -1460,13 +1460,14 @@ def _common_ctx(
     skip_checks: bool,
     check_timeout: int,
 ) -> tuple[str, str, Path, Ctx]:
-    # When ``--fork`` (TEROK_GH_FORK) is unset, push release-prep branches
-    # directly to the org rather than to a personal fork.  This is what a
-    # release officer with write access on the org repo (terok-warden via
-    # release-officers team) wants — pushes are attributed to that account
-    # consistently, audit trail stays in one place, no fork to keep in sync.
-    if not fork:
-        fork = org
+    # ``--fork`` / ``TEROK_GH_FORK`` is mandatory.  For release-officer
+    # use (warden in its distrobox), the wrapper injects
+    # ``TEROK_GH_FORK=terok-ai`` so release-prep branches land on the org
+    # directly; for local runs against a personal fork the operator sets
+    # it themselves.  We deliberately don't default it to the org here —
+    # silently pushing release branches into the canonical repo for a
+    # non-warden operator running locally would be a surprise.
+    fork = fork or die("TEROK_GH_FORK is not set (e.g. TEROK_GH_FORK=sliwowitz)")
     cd = Path(cache_dir)
     cd.mkdir(parents=True, exist_ok=True)
     return (
@@ -1996,7 +1997,9 @@ def execute(plan_file, yes, skip_checks, check_timeout, org, fork, cache_dir):
     plan_path = Path(plan_file)
     plan = Plan.model_validate_json(plan_path.read_text())
     plan.gh_org = org or plan.gh_org
-    plan.gh_fork = fork or plan.gh_fork or plan.gh_org
+    plan.gh_fork = fork or plan.gh_fork or die(
+        "Fork required: set TEROK_GH_FORK or embed in plan"
+    )
     ctx.plan_path = plan_path
 
     has_completed = any(s.status == "completed" for s in plan.steps)
