@@ -307,6 +307,12 @@ class PackagePlan(BaseModel):
     ``RELEASE`` step (``gh release create --notes-file``) and, for final
     releases only, by ``CHANGELOG_UPDATE``.  Falls back to
     ``--generate-notes`` if the file is missing at execute time."""
+    previous_release_version: str | None = None
+    """Anchor version for the auto-generated release notes.  For final
+    cuts, the most recent non-prerelease tag (so the summary spans the
+    whole alpha cycle, not just the promotion diff); for alpha cuts, the
+    latest tag of any kind (per-iteration delta); ``None`` for first-ever
+    releases (gh-api falls back to since-beginning-of-history)."""
 
 
 class Plan(BaseModel):
@@ -578,7 +584,12 @@ def ensure_clone(repo: str, cache_dir: Path, org: str, fork: str):
 
 
 def latest_version(repo: str, org: str) -> str:
-    """Get the latest release version from GitHub."""
+    """Most recent release of *repo*, including prereleases.
+
+    Used by ``bump_version`` to derive the next version — prereleases
+    must be visible so an alpha-to-final promotion (``v0.7.8a2`` + patch
+    → ``v0.7.8``) detects the suffix correctly.
+    """
     r = sh(
         "gh",
         "release",
@@ -596,18 +607,41 @@ def latest_version(repo: str, org: str) -> str:
     return r.stdout.strip().lstrip("v") or die(f"No releases for {repo}")
 
 
-def generate_release_notes(org: str, repo: str, new_version: str, previous: str) -> str:
+def latest_final_version(repo: str, org: str) -> str | None:
+    """Most recent non-prerelease release of *repo*, or ``None`` if there is none.
+
+    Used for ``previous_tag_name`` when generating notes for a final
+    release — alpha tags in between would otherwise truncate the
+    summary to just the promotion diff and hide the whole cycle's work.
+    """
+    r = sh(
+        "gh", "release", "list",
+        "--repo", f"{org}/{repo}",
+        "--limit", "50",  # generous window — first non-pre wins
+        "--json", "tagName,isPrerelease",
+        "--jq", "first(.[] | select(.isPrerelease == false) | .tagName) // empty",
+        capture=True,
+    )  # fmt: skip
+    return r.stdout.strip().lstrip("v") or None
+
+
+def generate_release_notes(org: str, repo: str, new_version: str, previous: str | None) -> str:
     """Ask GitHub for a draft release-notes body for *new_version*.
 
     Wraps ``gh api releases/generate-notes`` — the same auto-summary you
     get from ``gh release create --generate-notes``, but materialised
     upfront so the operator can curate it before the tag is pushed.
+
+    *previous* picks the diff anchor: latest non-prerelease for final
+    cuts (whole-cycle summary), latest of any kind for alpha cuts
+    (per-iteration delta), ``None`` for first-ever releases (gh-api
+    falls back to since-beginning-of-history).
     """
     args = [
         "gh", "api",
         f"/repos/{org}/{repo}/releases/generate-notes",
         "-f", f"tag_name=v{new_version}",
-        "-f", f"previous_tag_name=v{previous}",
+        *(["-f", f"previous_tag_name=v{previous}"] if previous else []),
         "--jq", ".body",
     ]
     r = sh(*args, capture=True, check=False)
@@ -1062,7 +1096,9 @@ def seed_notes(plan: Plan, cache_dir: Path) -> None:
         if path.exists():
             continue
         path.write_text(
-            generate_release_notes(plan.gh_org, pkg.repo, pkg.new_version, pkg.current_version)
+            generate_release_notes(
+                plan.gh_org, pkg.repo, pkg.new_version, pkg.previous_release_version
+            )
         )
 
 
@@ -1193,11 +1229,21 @@ def generate_plan(
             sibling_deps[dep] = ver
             planned_pins[f"{repo}:{dep}"] = ver
 
+        # Notes anchor: skip prereleases for final cuts so the summary
+        # spans the whole alpha cycle (not just the promotion diff); use
+        # the latest tag of any kind for alpha cuts (per-iteration delta).
+        previous = (
+            current
+            if (prerelease or new_ver is None)
+            else (latest_final_version(repo, org) or None)
+        )
+
         pkg = PackagePlan(
             repo=repo,
             action=action,
             current_version=current,
             new_version=new_ver,
+            previous_release_version=previous if new_ver else None,
             pr_number=pr_num,
             pr_branch=pr_branch,
             pr_url=pr_url,
