@@ -706,7 +706,9 @@ def wait_for_checks(pr_url: str, gh_repo: str, ctx: Ctx) -> str:
             console.print("[green]All checks passed![/]")
             return "passed"
 
-        console.print(f"[yellow]Checks failed on {pr_url}:[/]")
+        # Colon before the URL so a click-aware terminal doesn't slurp it
+        # into the link target (`.../pull/293:` → 404).
+        console.print(f"[yellow]Checks failed on:[/] {pr_url}")
         for c in failing:
             console.print(f"  {c['name']}: {c['bucket']}")
         if ctx.auto_yes:

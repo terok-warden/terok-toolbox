@@ -68,6 +68,37 @@ warden terok-release execute plan.json
 warden gh auth status                           # any tool in the image
 ```
 
+## Operator-mode runs (gh-only, no warden box)
+
+PyPI/TestPyPI publishes go through warden because the `pypi` environment
+gates on `triggering_actor == terok-warden`. **`--target=gh-only` runs do
+not** — the `github-release` job has no actor check (tag-creation is
+gated by the org's `v*.*.*` ruleset instead). So `--version-step=alpha`
+dev-cycle cuts and any other gh-only release can be driven by the
+operator directly from their own Fedora toolbox, no warden detour.
+
+One-time, inside the toolbox:
+
+```bash
+toolbox run sudo dnf install gh poetry \
+    python3-click python3-tomlkit python3-pydantic python3-rich
+```
+
+Then, from a clone of this repo on the host:
+
+```bash
+# Cross-repo PR chain, top kept as a deps-only PR (--open-top),
+# cut as PEP 440 alpha tags for dev-cycle integration.
+toolbox run python3 ./scripts/terok-release-chain.py \
+    quick executor:293,terok:912 --open-top \
+    --version-step alpha -n "Mixed Hosts" --target gh-only
+```
+
+`TEROK_GH_FORK` (or `--fork`) must point at the operator's personal fork
+(e.g. `sliwowitz`) — the script refuses to run without it.  `--target`
+is restricted to `gh-only` in operator mode; PyPI publishes still need
+the warden box because of the environment's required-reviewer gate.
+
 ## First-PyPI-release bootstrap
 
 Before any package is on real PyPI, do a TestPyPI validation pass per package
