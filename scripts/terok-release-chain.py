@@ -24,12 +24,22 @@ Publish targets (``--target``):
                      TestPyPI instead
     gh-only          GitHub Release only, no PyPI/TestPyPI
 
+Dev-cycle integration tags (``--version-step=alpha``):
+    Cuts ``vX.Y.ZaN`` pre-release tags between real PyPI releases so a
+    cross-repo PR chain can pin to tagged wheels on master instead of
+    git-branch refs.  Always implies ``--target=gh-only``, the GH
+    prerelease flag, and uniform chain-wide bumps (lower repos go
+    ``X.Y.Z`` → ``X.Y.(Z+1)a1`` too, not silently to final).  Promote
+    to a real release at the end of the cycle with a plain ``--version-
+    step=patch`` — the alpha suffix is dropped and PyPI publish resumes.
+
 Usage:
     terok-release quick sandbox
     terok-release quick sandbox..terok --open-top
     terok-release quick sandbox:42,executor:55,terok:706 --open-top
     terok-release quick clearance,sandbox:221..terok
     terok-release quick mkdocs --target=testpypi
+    terok-release quick sandbox..terok --version-step=alpha
     terok-release open feat/comms clearance
     terok-release plan sandbox..terok -o plan.json
     terok-release simulate plan.json
@@ -151,16 +161,37 @@ def slugify(text: str) -> str:
     return re.sub(r"-+", "-", re.sub(r"[^a-z0-9]+", "-", text.lower())).strip("-")
 
 
+_VER_RE = re.compile(r"^(\d+)\.(\d+)\.(\d+)(?:a(\d+))?$")
+
+
 def bump_version(ver: str, level: str = "patch") -> str:
-    """X.Y.Z -> next version at the given semver level."""
-    major, minor, patch = (int(x) for x in ver.split("."))
+    """``X.Y.Z`` or ``X.Y.ZaN`` → next version at the given level.
+
+    ``alpha`` cuts or continues a dev-cycle integration tag (no PyPI).
+    Other levels applied to an alpha version *promote* — the suffix is
+    dropped, then the base version is bumped (except ``patch``, which
+    promotes in place: ``X.Y.ZaN`` → ``X.Y.Z``).
+    """
+    m = _VER_RE.match(ver) or die(f"unparseable version: {ver}")
+    major, minor, patch = int(m[1]), int(m[2]), int(m[3])
+    alpha_n = int(m[4]) if m[4] else None
     match level:
         case "major":
             return f"{major + 1}.0.0"
         case "minor":
             return f"{major}.{minor + 1}.0"
-        case _:
-            return f"{major}.{minor}.{patch + 1}"
+        case "alpha":
+            return (
+                f"{major}.{minor}.{patch}a{alpha_n + 1}"
+                if alpha_n is not None
+                else f"{major}.{minor}.{patch + 1}a1"
+            )
+        case _:  # patch (default)
+            return (
+                f"{major}.{minor}.{patch}"  # promote alpha → final
+                if alpha_n is not None
+                else f"{major}.{minor}.{patch + 1}"
+            )
 
 
 def build_chain(start: str, end: str | None = None) -> list[str]:
@@ -1654,7 +1685,17 @@ _remote_options = _stack(
 
 _chain_options = _stack(
     click.argument("chain_spec"),
-    click.option("--version-step", default="patch", type=click.Choice(["major", "minor", "patch"])),
+    click.option(
+        "--version-step",
+        default="patch",
+        type=click.Choice(["major", "minor", "patch", "alpha"]),
+        help=(
+            "Bump level. ``alpha`` cuts a PEP 440 pre-release tag "
+            "(``X.Y.ZaN``) for dev-cycle integration — gh-only, marked "
+            "as a GH prerelease.  Other levels applied to an alpha base "
+            "promote (drop the suffix)."
+        ),
+    ),
     click.option("--version-step-uniform", is_flag=True),
     click.option("-n", "--name", "release_name", default="", help="Release name suffix"),
     click.option("--upgrade-pinned", is_flag=True),
@@ -1682,6 +1723,26 @@ _chain_options = _stack(
     _remote_options,
 )
 """Chain-spec positional + planner options shared by ``quick`` and ``plan``."""
+
+
+def _resolve_alpha_constraints(
+    version_step: str, target: str, prerelease: bool, uniform: bool
+) -> tuple[str, bool, bool]:
+    """Apply ``--version-step=alpha`` implications.
+
+    Alpha tags are dev-cycle integration artefacts: always gh-only,
+    always GH prereleases, always uniform across the chain so lower
+    repos don't accidentally promote to final mid-cycle.  Explicit
+    pypi/testpypi targets are rejected up front.
+    """
+    if version_step != "alpha":
+        return target, prerelease, uniform
+    if target in ("pypi", "testpypi"):
+        die(
+            f"--version-step=alpha is incompatible with --target={target} — "
+            "alpha tags are gh-only by design. Drop the suffix to publish to PyPI."
+        )
+    return "gh-only", True, True
 
 
 def _resolve_pin_style(pin_style: str | None, target: str) -> str:
@@ -1770,6 +1831,9 @@ def quick(
 
     chain, stop_at, pr_specs = _resolve_chain(chain_spec, live_deps, open_top=open_top)
 
+    target, prerelease, version_step_uniform = _resolve_alpha_constraints(
+        version_step, target, prerelease, version_step_uniform
+    )
     pin_style = _resolve_pin_style(pin_style, target)
     plan = generate_plan(
         chain,
@@ -1963,6 +2027,9 @@ def plan_cmd(
 
     chain, stop_at, pr_specs = _resolve_chain(chain_spec, live_deps, open_top=open_top)
 
+    target, prerelease, version_step_uniform = _resolve_alpha_constraints(
+        version_step, target, prerelease, version_step_uniform
+    )
     pin_style = _resolve_pin_style(pin_style, target)
     plan = generate_plan(
         chain,
