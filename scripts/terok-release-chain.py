@@ -1982,7 +1982,11 @@ def quick(
     _render_plan_preview(plan)
 
     if not pretend and not yes:
-        edit_notes(plan)
+        # Confirm-then-edit, not edit-then-confirm: the operator gets a
+        # pause to read the plan table before $EDITOR steals the screen,
+        # and a one-keystroke "n" to ship the seeded notes unchanged.
+        if alert_confirm("Edit release notes? (n to accept seeded drafts)", default=True):
+            edit_notes(plan)
         alert_confirm("Proceed?", default=True, abort=True)
 
     # Save plan
