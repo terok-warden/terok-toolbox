@@ -299,6 +299,11 @@ class PackagePlan(BaseModel):
     master releases as soon as the script opens its own PR.  Surfaced at the
     operator-attention points (per-package banner, merge-with-failures
     prompt, exception handler, end-of-run summary)."""
+    pr_title: str | None = None
+    """PR title — used to seed release notes for ``:PR`` releases, where
+    ``gh api releases/generate-notes`` can't see the unmerged PR's commits
+    yet.  Synthesised ``* <title> in <pr_url>`` line is appended to the
+    notes body so the seeded draft reflects what the release will include."""
     sibling_deps: dict[str, str] = {}
     notes_path: str | None = None
     """Filesystem path (string for JSON round-trip) to the per-release
@@ -625,7 +630,14 @@ def latest_final_version(repo: str, org: str) -> str | None:
     return r.stdout.strip().lstrip("v") or None
 
 
-def generate_release_notes(org: str, repo: str, new_version: str, previous: str | None) -> str:
+def generate_release_notes(
+    org: str,
+    repo: str,
+    new_version: str,
+    previous: str | None,
+    pr_number: int | None = None,
+    pr_title: str | None = None,
+) -> str:
     """Ask GitHub for a draft release-notes body for *new_version*.
 
     Wraps ``gh api releases/generate-notes`` — the same auto-summary you
@@ -636,6 +648,13 @@ def generate_release_notes(org: str, repo: str, new_version: str, previous: str 
     cuts (whole-cycle summary), latest of any kind for alpha cuts
     (per-iteration delta), ``None`` for first-ever releases (gh-api
     falls back to since-beginning-of-history).
+
+    *pr_number* / *pr_title* — when releasing from an unmerged PR, gh's
+    auto-summary covers only what's already on master since *previous*,
+    so the PR's own commits are invisible.  Splice a synthetic
+    ``* <title> in <pr_url>`` line into "What's Changed"; if gh returned
+    no body at all, build a minimal one from the PR plus a Full
+    Changelog compare link.
     """
     args = [
         "gh", "api",
@@ -645,10 +664,29 @@ def generate_release_notes(org: str, repo: str, new_version: str, previous: str 
         "--jq", ".body",
     ]
     r = sh(*args, capture=True, check=False)
-    return (
-        r.stdout
-        if r.returncode == 0 and r.stdout.strip()
-        else f"<!-- gh api generate-notes failed; write notes for v{new_version} here. -->\n"
+    body = r.stdout if r.returncode == 0 else ""
+
+    if pr_number and pr_title:
+        pr_line = f"* {pr_title} in https://github.com/{org}/{repo}/pull/{pr_number}"
+        if "## What's Changed\n" in body:
+            body = body.replace(
+                "## What's Changed\n",
+                f"## What's Changed\n{pr_line}\n",
+                1,
+            )
+        elif body.strip():
+            body = f"## What's Changed\n{pr_line}\n\n{body}"
+        else:
+            compare = (
+                f"\n**Full Changelog**: https://github.com/{org}/{repo}/compare/"
+                f"v{previous}...v{new_version}\n"
+                if previous
+                else ""
+            )
+            body = f"## What's Changed\n{pr_line}\n{compare}"
+
+    return body or (
+        f"<!-- gh api generate-notes failed; write notes for v{new_version} here. -->\n"
     )
 
 
@@ -662,7 +700,7 @@ def pr_info(number: int, gh_repo: str) -> dict:
         "--repo",
         gh_repo,
         "--json",
-        "headRefName,state,url",
+        "headRefName,state,title,url",
         capture=True,
     )
     return json.loads(r.stdout)
@@ -1097,7 +1135,12 @@ def seed_notes(plan: Plan, cache_dir: Path) -> None:
             continue
         path.write_text(
             generate_release_notes(
-                plan.gh_org, pkg.repo, pkg.new_version, pkg.previous_release_version
+                plan.gh_org,
+                pkg.repo,
+                pkg.new_version,
+                pkg.previous_release_version,
+                pkg.pr_number,
+                pkg.pr_title,
             )
         )
 
@@ -1202,13 +1245,19 @@ def generate_plan(
         pr_num: int | None = None
         pr_branch: str | None = None
         pr_url: str | None = None
+        pr_title: str | None = None
         if pr_specs and repo in pr_specs:
             info = pr_info(pr_specs[repo], gh_repo)
             if info.get("state") != "OPEN":
                 die(
                     f"PR #{pr_specs[repo]} for {repo} is {info.get('state', 'unknown')} — must be OPEN"
                 )
-            pr_num, pr_branch, pr_url = pr_specs[repo], info["headRefName"], info["url"]
+            pr_num, pr_branch, pr_url, pr_title = (
+                pr_specs[repo],
+                info["headRefName"],
+                info["url"],
+                info["title"],
+            )
 
         if repo == stop_at:
             action = Action.DEPS_ONLY
@@ -1247,6 +1296,7 @@ def generate_plan(
             pr_number=pr_num,
             pr_branch=pr_branch,
             pr_url=pr_url,
+            pr_title=pr_title,
             sibling_deps=sibling_deps,
         )
         packages.append(pkg)
