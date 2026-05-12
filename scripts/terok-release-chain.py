@@ -253,6 +253,7 @@ class StepKind(StrEnum):
     CHECKOUT = "checkout"
     VERSION_BUMP = "version_bump"
     DEP_UPDATE = "dep_update"
+    CHANGELOG_UPDATE = "changelog_update"
     POETRY_LOCK = "poetry_lock"
     GIT_COMMIT = "git_commit"
     GIT_PUSH = "git_push"
@@ -299,6 +300,13 @@ class PackagePlan(BaseModel):
     operator-attention points (per-package banner, merge-with-failures
     prompt, exception handler, end-of-run summary)."""
     sibling_deps: dict[str, str] = {}
+    notes_path: str | None = None
+    """Filesystem path (string for JSON round-trip) to the per-release
+    Markdown notes file.  Seeded by ``_seed_notes()`` after plan generation
+    with the output of ``gh api releases/generate-notes``; consumed by the
+    ``RELEASE`` step (``gh release create --notes-file``) and, for final
+    releases only, by ``CHANGELOG_UPDATE``.  Falls back to
+    ``--generate-notes`` if the file is missing at execute time."""
 
 
 class Plan(BaseModel):
@@ -586,6 +594,28 @@ def latest_version(repo: str, org: str) -> str:
         capture=True,
     )
     return r.stdout.strip().lstrip("v") or die(f"No releases for {repo}")
+
+
+def generate_release_notes(org: str, repo: str, new_version: str, previous: str) -> str:
+    """Ask GitHub for a draft release-notes body for *new_version*.
+
+    Wraps ``gh api releases/generate-notes`` — the same auto-summary you
+    get from ``gh release create --generate-notes``, but materialised
+    upfront so the operator can curate it before the tag is pushed.
+    """
+    args = [
+        "gh", "api",
+        f"/repos/{org}/{repo}/releases/generate-notes",
+        "-f", f"tag_name=v{new_version}",
+        "-f", f"previous_tag_name=v{previous}",
+        "--jq", ".body",
+    ]
+    r = sh(*args, capture=True, check=False)
+    return (
+        r.stdout
+        if r.returncode == 0 and r.stdout.strip()
+        else f"<!-- gh api generate-notes failed; write notes for v{new_version} here. -->\n"
+    )
 
 
 def pr_info(number: int, gh_repo: str) -> dict:
@@ -949,7 +979,13 @@ def _branch_for(pkg: PackagePlan, release_name: str) -> str:
 
 
 def plan_steps(
-    pkg: PackagePlan, org: str, fork: str, name: str, target: str, pin_style: str
+    pkg: PackagePlan,
+    org: str,
+    fork: str,
+    name: str,
+    target: str,
+    pin_style: str,
+    prerelease: bool,
 ) -> list[Step]:
     """Linear step sequence that realises one package's work in the plan."""
     do_release = pkg.action in (Action.RELEASE_MASTER, Action.RELEASE_PR)
@@ -976,6 +1012,11 @@ def plan_steps(
         add(StepKind.DEP_UPDATE, dep_repo=dep, dep_version=ver, pin_style=pin_style)
     if do_release:
         add(StepKind.VERSION_BUMP, version=pkg.new_version)
+        # Final releases prepend a `## vX.Y.Z — Title` section to
+        # ``CHANGELOG.md``; prereleases (alpha cuts) skip — they are
+        # cycle-internal integration tags, not user-facing release events.
+        if not prerelease:
+            add(StepKind.CHANGELOG_UPDATE, version=pkg.new_version, title=name)
     add(StepKind.POETRY_LOCK)
     add(StepKind.GIT_COMMIT, message=commit_msg)
     add(StepKind.GIT_PUSH, branch=branch, fork=fork)
@@ -1002,6 +1043,62 @@ def plan_steps(
             add(StepKind.WORKFLOW_WAIT, ref=tag)
             add(StepKind.PYPI_POLL, version=pkg.new_version)
     return steps
+
+
+def seed_notes(plan: Plan, cache_dir: Path) -> None:
+    """Materialise per-package release-notes drafts under *cache_dir*/notes/.
+
+    Idempotent: existing files are preserved, never overwritten — operator
+    edits made between ``plan`` and ``execute`` survive.  To force a fresh
+    draft, delete the notes file and re-run.
+    """
+    notes_dir = cache_dir / "notes"
+    notes_dir.mkdir(parents=True, exist_ok=True)
+    for pkg in plan.packages:
+        if not pkg.new_version:
+            continue
+        path = notes_dir / f"{pkg.repo}-v{pkg.new_version}.md"
+        pkg.notes_path = str(path)
+        if path.exists():
+            continue
+        path.write_text(
+            generate_release_notes(plan.gh_org, pkg.repo, pkg.new_version, pkg.current_version)
+        )
+
+
+def edit_notes(plan: Plan) -> None:
+    """Open ``$EDITOR`` once per releasing package's notes file.
+
+    Click respects ``$EDITOR`` directly; set ``EDITOR=true`` for headless
+    / agent-mode runs to make the editor a no-op so the seeded notes ship
+    as-is.
+    """
+    import click as _click  # lazy: editor not needed for plan/simulate/execute
+
+    for pkg in plan.packages:
+        if pkg.notes_path and Path(pkg.notes_path).exists():
+            console.print(f"  Editing notes: [bold]{pkg.repo}[/] → {pkg.notes_path}")
+            _click.edit(filename=pkg.notes_path, require_save=False, extension=".md")
+
+
+def prepend_changelog(path: Path, version: str, title: str, body: str) -> None:
+    """Insert ``## v<version> — <title>\\n\\n<body>`` above the first ``## v…`` section.
+
+    No-op when the section is already present (idempotent on resume); falls
+    back to appending if the file has no prior versioned sections yet.
+    """
+    content = path.read_text()
+    if f"## v{version}" in content:
+        return
+    header = f"## v{version} — {title}\n\n" if title else f"## v{version}\n\n"
+    section = header + body.rstrip() + "\n\n"
+    lines = content.splitlines(keepends=True)
+    insert_at = next(
+        (i for i, line in enumerate(lines) if line.startswith("## v")),
+        len(lines),
+    )
+    lines.insert(insert_at, section)
+    path.write_text("".join(lines))
 
 
 def _resolve_sibling_version(
@@ -1107,7 +1204,9 @@ def generate_plan(
             sibling_deps=sibling_deps,
         )
         packages.append(pkg)
-        all_steps.extend(plan_steps(pkg, org, fork, release_name, target, pin_style))
+        all_steps.extend(
+            plan_steps(pkg, org, fork, release_name, target, pin_style, prerelease)
+        )
         if new_ver:
             released[repo] = new_ver
 
@@ -1202,11 +1301,30 @@ def execute_step(step: Step, plan: Plan, ctx: Ctx):
             else:
                 set_dep_pypi(repo_dir / "pyproject.toml", p["dep_repo"], p["dep_version"])
 
+        case StepKind.CHANGELOG_UPDATE:
+            changelog = repo_dir / "CHANGELOG.md"
+            if not changelog.exists():
+                console.print(
+                    f"[dim]No CHANGELOG.md in {step.package} — skipping prepend.[/]"
+                )
+                return
+            pkg = _package(plan, step.package)
+            notes = Path(pkg.notes_path) if pkg.notes_path else None
+            if not notes or not notes.exists():
+                console.print(
+                    f"[dim]No notes file for {step.package} — skipping CHANGELOG update.[/]"
+                )
+                return
+            prepend_changelog(changelog, p["version"], p.get("title", ""), notes.read_text())
+
         case StepKind.POETRY_LOCK:
             sh("poetry", "lock", cwd=repo_dir)
 
         case StepKind.GIT_COMMIT:
-            sh("git", "add", "pyproject.toml", "poetry.lock", cwd=repo_dir)
+            paths = ["pyproject.toml", "poetry.lock"]
+            if (repo_dir / "CHANGELOG.md").exists():
+                paths.append("CHANGELOG.md")
+            sh("git", "add", *paths, cwd=repo_dir)
             # Idempotent: HEAD already carries this commit message (re-run of a
             # previously-committed step), or nothing is staged (a prior feature
             # PR already landed the version bump + lockfile on master, so the
@@ -1332,16 +1450,16 @@ def execute_step(step: Step, plan: Plan, ctx: Ctx):
                 console.print(f"[dim]Release {p['tag']} already exists — skipping.[/]")
             else:
                 cmd = [
-                    "gh",
-                    "release",
-                    "create",
-                    p["tag"],
-                    "--repo",
-                    gh_repo,
-                    "--title",
-                    p["title"],
-                    "--generate-notes",
-                ]
+                    "gh", "release", "create", p["tag"],
+                    "--repo", gh_repo,
+                    "--title", p["title"],
+                ]  # fmt: skip
+                pkg = _package(plan, step.package)
+                notes = Path(pkg.notes_path) if pkg.notes_path else None
+                if notes and notes.exists():
+                    cmd += ["--notes-file", str(notes)]
+                else:
+                    cmd.append("--generate-notes")
                 if plan.prerelease:
                     cmd.append("--prerelease")
                 sh(*cmd)
@@ -1626,6 +1744,12 @@ def _render_plan_preview(plan: Plan) -> None:
         action = pkg.action.value + (f" #{pkg.pr_number}" if pkg.pr_number else "")
         table.add_row(str(i), pkg.repo, action, ver, dep_str)
     console.print(table)
+    notes = [pkg.notes_path for pkg in plan.packages if pkg.notes_path]
+    if notes:
+        console.print(
+            "\n[dim]Release notes seeded; edit before proceeding:[/]\n"
+            + "\n".join(f"  [dim]•[/] {p}" for p in notes)
+        )
 
 
 def _resolve_chain(
@@ -1853,10 +1977,12 @@ def quick(
         target=target,
         pin_style=pin_style,
     )
+    seed_notes(plan, cd)
 
     _render_plan_preview(plan)
 
     if not pretend and not yes:
+        edit_notes(plan)
         alert_confirm("Proceed?", default=True, abort=True)
 
     # Save plan
@@ -2049,10 +2175,14 @@ def plan_cmd(
         target=target,
         pin_style=pin_style,
     )
+    seed_notes(plan, cd)
 
     out = Path(output) if output else cd / "plans" / f"{datetime.now():%Y%m%d-%H%M%S}.json"
     save_plan(plan, out)
     console.print(f"Plan written to {out}")
+    for pkg in plan.packages:
+        if pkg.notes_path:
+            console.print(f"  [dim]notes:[/] {pkg.notes_path}")
 
 
 @cli.command(context_settings=_CLICK_CONTEXT)

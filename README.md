@@ -68,6 +68,34 @@ warden terok-release execute plan.json
 warden gh auth status                           # any tool in the image
 ```
 
+## Release notes
+
+After `plan` (and inside `quick`), the script seeds a Markdown notes
+draft per releasing package using GitHub's own auto-summary:
+
+```
+~/.cache/terok-release/notes/<pkg>-v<X.Y.Z>.md
+```
+
+The seeded file is already valid release-note content — operator's
+typical action is **subtractive**: delete dep-bump lines, internal
+refactors, and cosmetic fixes from the auto-generated PR list; keep the
+meaningful entries.  `:wq` without edits ships the seeded notes as-is.
+
+- **`quick`** opens `$EDITOR` on each notes file before the "Proceed?"
+  prompt.  Set `EDITOR=true` for headless / agent runs (the seeded
+  notes ship unchanged).
+- **`plan`** doesn't open an editor — it prints the seeded paths so
+  agents can `Write` to them between `plan` and `execute`.
+- **Re-running `plan`** keeps existing notes (operator edits survive
+  crash-resume); delete the file to force a fresh draft.
+
+**Final releases** (no `--version-step=alpha`) also prepend
+`## vX.Y.Z — Title` to each package's `CHANGELOG.md` in the
+release-prep commit — single source of truth for the GH Release body
+and the in-repo changelog.  Alpha cuts seed notes but leave the
+changelog untouched.
+
 ## Operator-mode runs (gh-only, no warden box)
 
 PyPI/TestPyPI publishes go through warden because the `pypi` environment
