@@ -8,12 +8,17 @@ it, then execute step-by-step with crash-recovery.  Supports full and
 GitHub-prerelease releases, master and from-PR sources, and any mix.
 
 Chain spec grammar (positional arg to ``quick`` and ``plan``):
-    pkg              one package (master)
+    pkg              one package (equivalent to ``pkg..pkg``)
     pkg:NUM          release pkg from PR #NUM
-    A..B             range; intermediates filled from master
-    A,B,C            list (downstream closure auto-includes packages whose
-                     pyproject pin to a released package needs bumping)
+    A..B             range; intermediates filled from CHAIN order
+    A,B,C            literal list — released exactly as named, no cascade
     A,B:NUM..C       any combination
+
+Selection is literal: a bare name or comma-list is taken at face value.
+For a full cascade through dependents, use a range (``sandbox..terok``).
+Non-contiguous selections (e.g. ``clearance,executor``) are allowed but
+produce a yellow warning when an unbumped intermediate (here: sandbox)
+means a downstream release won't see the new upstream version.
 
 Publish targets (``--target``):
     pypi             production — auto-triggered ``release.yml`` lands the
@@ -92,8 +97,7 @@ CHAIN = [
 #
 # ``mkdocs-terok`` is a docs-only sibling: every other repo uses it for
 # their docs build but it is *not* a runtime pin in any pyproject, so it
-# stays an empty-deps leaf and the closure logic naturally never drags it
-# into a chain release. Release it on its own when it changes.
+# stays an empty-deps leaf — release it on its own when it changes.
 DEPS: DepGraph = {
     "mkdocs-terok": [],
     "terok-clearance": [],
@@ -1226,10 +1230,10 @@ def generate_plan(
 
     *live_deps* is the verified live dep graph for the full ``CHAIN``
     family (callers run ``_verify_dep_graph(CHAIN, cache_dir)`` up front
-    and pass the result here — and to ``_resolve_chain``, so closure runs
-    on the same authoritative view).  Emits one ``PackagePlan`` + step
-    sequence per repo, in order; downstream repos pick sibling versions
-    from what upstream repos ship in the same run.
+    and pass the result here — and to ``_resolve_chain``, so gap detection
+    runs on the same authoritative view).  Emits one ``PackagePlan`` +
+    step sequence per repo, in order; downstream repos pick sibling
+    versions from what upstream repos ship in the same run.
     """
     packages: list[PackagePlan] = []
     all_steps: list[Step] = []
@@ -1787,29 +1791,39 @@ def parse_chain_spec(spec: str) -> list[tuple[str, int | None]]:
     return entries
 
 
-def _downstream_closure(explicit: list[str], graph: DepGraph) -> list[str]:
-    """Add every package that transitively depends on any package in *explicit*.
+def _gap_pairs(resolved: list[str], graph: DepGraph) -> list[tuple[str, str]]:
+    """Find ``(downstream, upstream)`` pairs where releases won't propagate.
 
-    A new release of P bumps P's version, so every Q whose pyproject pins P
-    (directly or transitively) must also be re-released so its URL pin can
-    be bumped — otherwise consumers see two URL-pinned versions of the same
-    package and Poetry blocks the install.  Returned list is ordered by
-    ``CHAIN``.
+    A downstream release Q only "sees" a new upstream release P if every
+    intermediate package on a dep path Q → … → P is also being released
+    (its URL pin gets updated in this run).  Otherwise the unbumped
+    intermediate's frozen pin chain still points at the *old* P.
 
-    *graph* must be the verified live dep graph from ``_verify_dep_graph``,
-    not the vendored ``DEPS``: a stale ``DEPS`` would silently drop repos
-    out of the closure (the missed repo never lands in any chain so its
-    pyproject mismatch goes undetected as well).  Callers must validate
-    against the cloned ``pyproject.toml`` files first.
+    Returned pairs are exactly those where Q transitively depends on P in
+    the full graph but no dep path Q → … → P lies entirely inside the
+    resolved set — pure-literal partial subgraphs that the operator may
+    or may not have intended.  Caller renders these as a warning.
     """
-    needed = set(explicit)
-    while True:
-        added = {
-            r for r, deps in graph.items() if r not in needed and any(d in needed for d in deps)
-        }
-        if not added:
-            return [r for r in CHAIN if r in needed]
-        needed |= added
+    sel = set(resolved)
+    gaps: list[tuple[str, str]] = []
+
+    def reachable(start: str, *, gate: set[str] | None) -> set[str]:
+        seen: set[str] = set()
+        stack = [start]
+        while stack:
+            for d in graph.get(stack.pop(), []):
+                if d in seen:
+                    continue
+                seen.add(d)
+                if gate is None or d in gate:
+                    stack.append(d)
+        return seen
+
+    for q in resolved:
+        full = reachable(q, gate=None)
+        via_sel = reachable(q, gate=sel)
+        gaps.extend((q, p) for p in resolved if p != q and p in full and p not in via_sel)
+    return gaps
 
 
 def _render_plan_preview(plan: Plan) -> None:
@@ -1854,24 +1868,33 @@ def _resolve_chain(
     *,
     open_top: bool = False,
 ) -> tuple[list[str], str | None, dict[str, int]]:
-    """Parse the chain spec, expand by downstream closure, return planner inputs.
+    """Parse the chain spec, order it by ``CHAIN``, return planner inputs.
 
-    The closure is essential: typing ``clearance,sandbox:221`` releases
-    executor and terok too, because their pin to clearance would otherwise
-    fall out of sync.  See ``_downstream_closure`` for the full rationale.
+    Selection is literal — exactly what was named (ranges expanded), no
+    auto-cascade through dependents.  Want a full propagation? Write the
+    range explicitly (``sandbox..terok``).
 
-    *graph* must be the verified live dep graph (callers run
-    ``_verify_dep_graph(CHAIN, cache_dir)`` first to validate ``DEPS``
-    against cloned pyproject.toml files and pass the result here).  This
-    prevents a stale ``DEPS`` from silently dropping repos out of the
-    closure.
+    *graph* is the verified live dep graph (callers run
+    ``_verify_dep_graph(CHAIN, cache_dir)`` first); used here only to
+    detect non-contiguous selections — pairs where a downstream release
+    transitively depends on an upstream release through an intermediate
+    that isn't being bumped, so the downstream release won't see the new
+    upstream pin.  Such pairs produce a yellow warning but do not abort.
 
     Returns ``(ordered_chain, stop_at, pr_specs)``.  With ``--open-top``,
     the last package becomes ``DEPS_ONLY`` (deps update only, no release).
     """
     entries = parse_chain_spec(spec)
     pr_specs = {repo: pr for repo, pr in entries if pr is not None}
-    chain = _downstream_closure([repo for repo, _ in entries], graph)
+    named = {repo for repo, _ in entries}
+    chain = [r for r in CHAIN if r in named]
+
+    for downstream, upstream in _gap_pairs(chain, graph):
+        console.print(
+            f"[yellow]Note: {downstream} transitively pins {upstream} through an "
+            f"unbumped intermediate — its new release won't see new {upstream}.[/]"
+        )
+
     return chain, (chain[-1] if open_top else None), pr_specs
 
 
@@ -2019,21 +2042,26 @@ def quick(
 
     \b
     CHAIN_SPEC grammar:
-      pkg                              one package
+      pkg                              one package (== pkg..pkg)
       pkg:NUM                          release pkg from PR #NUM
-      A..B                             range; intermediates filled from master
-      A,B,C                            list (downstream closure auto-includes)
+      A..B                             range; intermediates filled from CHAIN
+      A,B,C                            literal list — no cascade
       A,B:NUM..C                       any combination
 
     \b
+    Selection is literal. For a full cascade through dependents, write the
+    range (``sandbox..terok``). Non-contiguous lists are allowed but warned
+    when an unbumped intermediate breaks pin propagation.
+
+    \b
     Examples:
-      quick sandbox                       single package from master
-      quick sandbox..terok                chain, all from master
+      quick sandbox                       just sandbox
+      quick sandbox..terok                full cascade through to terok
       quick sandbox..terok --open-top     terok stays as deps-only PR
       quick sandbox:155                   release from one PR
       quick sandbox:155,executor:167,terok:706 --open-top
                                           PR chain; terok deps-only on its PR
-      quick clearance,sandbox:221..terok  mixed; closure adds executor
+      quick clearance,sandbox:221..terok  mixed; literal union
       quick sandbox..terok --prerelease   prerelease badge on each
     """
     org, fork, cd, ctx = _common_ctx(org, fork, cache_dir, pretend, yes, skip_checks, check_timeout)
@@ -2042,10 +2070,9 @@ def quick(
     if not release_name and not pretend:
         release_name = alert_prompt("Release name (empty for version-only)", default="")
 
-    # Clone the WHOLE family up front so closure can run on the verified
-    # live dep graph — a stale vendored ``DEPS`` would otherwise silently
-    # drop repos out of the closure (and the missing repo's pyproject
-    # mismatch would never reach ``_verify_dep_graph``).
+    # Clone the WHOLE family up front so gap detection and dep validation
+    # run on the verified live dep graph — a stale vendored ``DEPS`` would
+    # otherwise miss a pyproject mismatch on a repo not in this run.
     console.print("\n[bold]Syncing clones...[/]")
     for repo in CHAIN:
         ensure_clone(repo, cd, org, fork)
@@ -2247,8 +2274,8 @@ def plan_cmd(
             "[yellow]Warning: no release name (-n). Release titles will be version-only.[/]"
         )
 
-    # Clone the WHOLE family up front so closure runs on the verified live
-    # dep graph (see ``quick`` for the rationale).
+    # Clone the WHOLE family up front so gap detection and dep validation
+    # run on the verified live dep graph (see ``quick`` for the rationale).
     for repo in CHAIN:
         ensure_clone(repo, cd, org, fork)
     live_deps = _verify_dep_graph(CHAIN, cd)
