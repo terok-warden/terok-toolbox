@@ -839,6 +839,11 @@ def _gh_merge_commit(pr_url: str, gh_repo: str) -> str:
 def squash_merge(pr_url: str, gh_repo: str) -> str:
     """Squash-merge the PR and return the resulting master commit SHA.
 
+    Passes ``--body ""`` so the squash commit's body is empty — the PR
+    description routinely runs many lines and the same information is one
+    click away via the ``(#NUM)`` link gh appends to the default subject.
+    Subject stays as gh's default: ``<PR title> (#<num>)``.
+
     Tolerates a narrow race: ``gh pr merge`` can report "already in
     progress" or "already merged" when another automation (or a fast
     operator) got there first — in that case we poll PR state briefly
@@ -846,7 +851,11 @@ def squash_merge(pr_url: str, gh_repo: str) -> str:
     """
     console.print("Squash-merging PR...")
     r = subprocess.run(
-        ["gh", "pr", "merge", pr_url, "--repo", gh_repo, "--squash", "--delete-branch", "--admin"],
+        [
+            "gh", "pr", "merge", pr_url, "--repo", gh_repo,
+            "--squash", "--delete-branch", "--admin",
+            "--body", "",
+        ],
         capture_output=True,
         text=True,
     )
