@@ -441,64 +441,114 @@ def sh(
 # ── TOML ops ──────────────────────────────────────────────────────────────
 #
 # Uses tomlkit to preserve comments and formatting.
+#
+# Runtime deps live in PEP 621 ``[project.dependencies]`` as an array of
+# PEP 508 strings (``name @ url``, ``name>=X,<Y``, ``name @ git+url@ref``).
+# The chain script finds entries by their leading project name and rewrites
+# the whole string in place — Poetry's old ``[tool.poetry.dependencies]``
+# inline-table form is no longer accepted.  ``[tool.poetry].version``
+# stays as the dynvers fallback (``[project].dynamic = ["version"]``);
+# ``set_version_toml`` keeps writing there.
+
+
+_PEP508_NAME_RE = re.compile(r"^\s*([A-Za-z0-9][A-Za-z0-9._-]*)")
+
+
+def _pep508_name(s: str) -> str:
+    """Extract the project name from a PEP 508 dep string (everything up to
+    the first version/URL/marker boundary)."""
+    m = _PEP508_NAME_RE.match(s)
+    return m.group(1) if m else ""
 
 
 def _toml_deps(path: Path) -> tuple[tomlkit.TOMLDocument, Any]:
+    """Return ``(doc, runtime_deps_array)`` for ``[project.dependencies]``."""
     doc = tomlkit.parse(path.read_text())
-    return doc, doc["tool"]["poetry"]["dependencies"]
+    return doc, doc["project"]["dependencies"]
+
+
+def _find_dep_index(deps: Any, dep_repo: str) -> int | None:
+    """Index of the PEP 508 string in *deps* whose name matches *dep_repo*.
+
+    Tries both hyphen (``terok-shield``) and underscore (``terok_shield``)
+    forms since PEP 503 treats them equivalently.
+    """
+    targets = {dep_repo, pkg_name(dep_repo)}
+    for i, entry in enumerate(deps):
+        if _pep508_name(str(entry)) in targets:
+            return i
+    return None
 
 
 def set_version_toml(path: Path, version: str):
-    """Set the version field in pyproject.toml."""
+    """Set the version field in pyproject.toml.
+
+    Lives at ``[tool.poetry].version`` even after the PEP 621 migration —
+    ``[project].dynamic = ["version"]`` tells Poetry the version is
+    dynamic, and ``poetry-dynamic-versioning`` reads it from here as the
+    fallback when no git tag is present.
+    """
     doc = tomlkit.parse(path.read_text())
     doc["tool"]["poetry"]["version"] = version
     path.write_text(tomlkit.dumps(doc))
 
 
 def set_dep_url(path: Path, dep_repo: str, version: str, org: str):
-    """Set a dependency to a wheel URL (works for both URL and git-branch sources)."""
+    """Set a sibling dep to a wheel URL via PEP 508 ``name @ url`` syntax."""
     doc, deps = _toml_deps(path)
-    key = dep_repo if dep_repo in deps else pkg_name(dep_repo)
-    if key not in deps:
+    idx = _find_dep_index(deps, dep_repo)
+    if idx is None:
         return
-    t = tomlkit.inline_table()
-    t.append("url", wheel_url(org, dep_repo, version))
-    deps[key] = t
+    name = _pep508_name(str(deps[idx])) or dep_repo
+    deps[idx] = f"{name} @ {wheel_url(org, dep_repo, version)}"
     path.write_text(tomlkit.dumps(doc))
 
 
 def set_dep_pypi(path: Path, dep_repo: str, version: str):
-    """Set a dependency to a PyPI version specifier (Poetry caret form).
+    """Set a sibling dep to a PyPI version range (PEP 508, caret-equivalent).
 
-    ``terok-shield = "^0.6.38"`` resolves to >=0.6.38, <1.0.0 (Poetry's
-    caret semantics; for the 0.x range this is equivalent to PEP 440's
-    minor-pinning tilde-release).  Operators wanting strict ``==`` pins
-    can swap the leading ``^`` manually; the chain script doesn't try
-    to second-guess that decision per release.
+    ``terok-shield = "^0.6.38"`` (Poetry) → ``terok-shield>=0.6.38,<0.7.0``
+    (PEP 508), matching Poetry caret semantics: the upper bound bumps the
+    leftmost non-zero segment.  Operators wanting strict ``==`` pins can
+    edit the resulting string manually; the chain script doesn't
+    second-guess that decision per release.
     """
     doc, deps = _toml_deps(path)
-    key = dep_repo if dep_repo in deps else pkg_name(dep_repo)
-    if key not in deps:
+    idx = _find_dep_index(deps, dep_repo)
+    if idx is None:
         return
-    deps[key] = f"^{version}"
+    name = _pep508_name(str(deps[idx])) or dep_repo
+    parts = [int(p) for p in version.split(".")]
+    major = parts[0]
+    minor = parts[1] if len(parts) > 1 else 0
+    patch = parts[2] if len(parts) > 2 else 0
+    if major > 0:
+        upper = f"{major + 1}.0.0"
+    elif minor > 0:
+        upper = f"0.{minor + 1}.0"
+    else:
+        upper = f"0.0.{patch + 1}"
+    deps[idx] = f"{name}>={version},<{upper}"
     path.write_text(tomlkit.dumps(doc))
 
 
 def set_branch_dep(path: Path, dep_repo: str, branch: str, fork: str):
-    """Set a dependency to a git-branch reference (for PR chain development)."""
+    """Set a sibling dep to a git+branch ref via PEP 508."""
     doc, deps = _toml_deps(path)
-    key = dep_repo if dep_repo in deps else pkg_name(dep_repo)
-    if key not in deps:
+    idx = _find_dep_index(deps, dep_repo)
+    if idx is None:
         return
-    t = tomlkit.inline_table()
-    t.append("git", f"https://github.com/{fork}/{dep_repo}.git")
-    t.append("branch", branch)
-    deps[key] = t
+    name = _pep508_name(str(deps[idx])) or dep_repo
+    deps[idx] = f"{name} @ git+https://github.com/{fork}/{dep_repo}.git@{branch}"
     path.write_text(tomlkit.dumps(doc))
 
 
 def pinned_version(path: Path, dep_repo: str, org: str) -> str | None:
-    """Extract version from a URL wheel dep, or None if git/missing."""
+    """Extract version from a URL-pinned sibling dep, or None if git/missing.
+
+    Regex against raw file text — format-agnostic (works whether the pin
+    is the old ``{url = ...}`` table or the new PEP 508 ``name @ <url>``).
+    """
     m = re.search(rf"{org}/{dep_repo}/releases/download/v([^/]+)/", path.read_text())
     return m.group(1) if m else None
 
@@ -511,15 +561,17 @@ def pinned_version(path: Path, dep_repo: str, org: str) -> str | None:
 
 
 def _discover_sibling_deps(pyproject_path: Path, family: list[str]) -> list[str]:
-    """Members of *family* that appear as dependency keys in ``pyproject_path``.
+    """Members of *family* that appear as PEP 508 entries in ``pyproject_path``.
 
-    ``family`` must be the full package family (typically ``CHAIN``) — not a
-    slice.  A sliced family would miss legitimate upstream pins and produce
-    false drift reports.  Matches both hyphen (``terok-shield``) and
-    underscore (``terok_shield``) forms since Poetry accepts either.
+    ``family`` must be the full package family (typically ``CHAIN``) — not
+    a slice.  A sliced family would miss legitimate upstream pins and
+    produce false drift reports.  Matches both hyphen (``terok-shield``)
+    and underscore (``terok_shield``) forms since PEP 503 treats them
+    equivalently.
     """
     _, deps = _toml_deps(pyproject_path)
-    return [m for m in family if m in deps or pkg_name(m) in deps]
+    names = {_pep508_name(str(d)) for d in deps}
+    return [m for m in family if m in names or pkg_name(m) in names]
 
 
 def _verify_dep_graph(chain: list[str], cache_dir: Path) -> DepGraph:
