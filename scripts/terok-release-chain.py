@@ -2166,10 +2166,14 @@ def quick(
     _render_plan_preview(plan)
 
     if not pretend and not yes:
-        # Confirm-then-edit, not edit-then-confirm: the operator gets a
-        # pause to read the plan table before $EDITOR steals the screen,
-        # and a one-keystroke "n" to ship the seeded notes unchanged.
-        if alert_confirm("Edit release notes? (n to accept seeded drafts)", default=True):
+        # Default-N because the interactive operator usually wants to edit;
+        # plain Enter opens $EDITOR.  ``-y`` skips the prompt entirely and
+        # ships the seeded notes as-is, which matches ``-y``'s "auto-accept
+        # defaults" semantics — answering "edit" in unattended mode is
+        # impossible anyway.
+        if not alert_confirm(
+            "Accept default release notes? (n to edit)", default=False
+        ):
             edit_notes(plan)
         alert_confirm("Proceed?", default=True, abort=True)
 
