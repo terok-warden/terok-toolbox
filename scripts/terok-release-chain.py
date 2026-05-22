@@ -84,6 +84,7 @@ console = Console(stderr=True)
 
 CHAIN = [
     "mkdocs-terok",
+    "terok-util",
     "terok-clearance",
     "terok-shield",
     "terok-sandbox",
@@ -98,13 +99,17 @@ CHAIN = [
 # ``mkdocs-terok`` is a docs-only sibling: every other repo uses it for
 # their docs build but it is *not* a runtime pin in any pyproject, so it
 # stays an empty-deps leaf — release it on its own when it changes.
+#
+# ``terok-util`` is the bottom of the runtime chain — every other
+# package depends on it; it depends on nothing in the ecosystem.
 DEPS: DepGraph = {
     "mkdocs-terok": [],
-    "terok-clearance": [],
-    "terok-shield": [],
-    "terok-sandbox": ["terok-shield", "terok-clearance"],
-    "terok-executor": ["terok-sandbox"],
-    "terok": ["terok-executor", "terok-sandbox", "terok-shield", "terok-clearance"],
+    "terok-util": [],
+    "terok-clearance": ["terok-util"],
+    "terok-shield": ["terok-util"],
+    "terok-sandbox": ["terok-util", "terok-shield", "terok-clearance"],
+    "terok-executor": ["terok-util", "terok-sandbox"],
+    "terok": ["terok-util", "terok-executor", "terok-sandbox", "terok-shield", "terok-clearance"],
 }
 
 ALIASES = (
