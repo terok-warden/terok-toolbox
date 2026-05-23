@@ -815,6 +815,24 @@ def pr_state(url: str, gh_repo: str) -> str:
     return r.stdout.strip()
 
 
+def _require_open_prs(pr_specs: dict[str, int], org: str) -> None:
+    """Abort if any PR-pinned repo is not in the ``OPEN`` state.
+
+    The clone cache will happily fetch ``refs/pull/N/head`` for a merged
+    or closed PR, leaving the dep-graph check to fail later on whatever
+    pyproject shape that PR captured.  Catching it here means a typo
+    like ``clearance:12`` (long-merged) fails fast with a clear message
+    instead of a ``tomlkit.NonExistentKey: 'project'`` traceback.
+
+    Release officers know what to do with a closed/merged PR (re-run
+    against master, pick the right number); we just bail.
+    """
+    for repo, pr in pr_specs.items():
+        state = pr_state(str(pr), f"{org}/{repo}")
+        if state != "OPEN":
+            die(f"{repo}#{pr} is {state}, expected OPEN — check the PR number")
+
+
 _MIN_GH_VERSION = (2, 73, 0)
 """Minimum ``gh`` version for ``gh pr checks --json``."""
 
@@ -2171,6 +2189,7 @@ def quick(
     # pyproject.toml — checking against ``upstream/master`` for a repo
     # whose PR introduces a new sibling dep would always false-positive.
     pr_specs = {repo: pr for repo, pr in parse_chain_spec(chain_spec) if pr is not None}
+    _require_open_prs(pr_specs, org)
 
     # Clone the WHOLE family up front so gap detection and dep validation
     # run on the verified live dep graph — a stale vendored ``DEPS`` would
@@ -2385,6 +2404,7 @@ def plan_cmd(
     # on the right ref before dep-graph verification reads its
     # pyproject.toml (see ``quick`` for the full rationale).
     pr_specs = {repo: pr for repo, pr in parse_chain_spec(chain_spec) if pr is not None}
+    _require_open_prs(pr_specs, org)
 
     # Clone the WHOLE family up front so gap detection and dep validation
     # run on the verified live dep graph (see ``quick`` for the rationale).
