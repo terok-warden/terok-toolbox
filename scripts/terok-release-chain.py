@@ -614,19 +614,27 @@ def _verify_dep_graph(chain: list[str], cache_dir: Path) -> DepGraph:
 # ── Clone cache ───────────────────────────────────────────────────────────
 
 
-def ensure_clone(repo: str, cache_dir: Path, org: str, fork: str):
+def ensure_clone(repo: str, cache_dir: Path, org: str, fork: str, pr: int | None = None):
     """Create or sync a repo clone in the release cache.
 
     Fetches with ``--tags --prune-tags`` so tags deleted on the remote
     also disappear from the cache.  Otherwise stale local tags can
     fool ``latest_version`` / dep-graph checks into thinking versions
     still exist that have been yanked or rewritten upstream.
+
+    When *pr* is set, the working tree is checked out at that PR's
+    head ref (``refs/pull/<N>/head``) instead of ``upstream/master``.
+    Dep-graph verification and any other read-pyproject step then sees
+    the PR-branch ``pyproject.toml`` — the only correct source when
+    the operator is releasing from open PRs (e.g. cross-repo refactors
+    that add a new sibling dep on every consumer in one wave).
     """
     repo_dir = cache_dir / repo
     upstream_url = f"git@github.com:{org}/{repo}.git"
     fork_url = f"git@github.com:{fork}/{repo}.git"
     if (repo_dir / ".git").is_dir():
-        console.print(f"  [cyan]{repo:<16}[/] syncing...", end="\r")
+        ref_label = f"PR #{pr}" if pr is not None else "upstream/master"
+        console.print(f"  [cyan]{repo:<16}[/] syncing to {ref_label}...", end="\r")
         # Normalize remote URLs every sync in case the operator switched
         # between fork-based and same-org workflows (eg. ``--fork`` flag
         # changed) — saves a manual ``git remote set-url`` on each clone.
@@ -636,14 +644,36 @@ def ensure_clone(repo: str, cache_dir: Path, org: str, fork: str):
             "git", "fetch", "upstream", "--quiet", "--tags", "--prune-tags", "--force",
             cwd=repo_dir,
         )  # fmt: skip
-        sh("git", "reset", "--hard", "upstream/master", "-q", cwd=repo_dir)
-        sh("git", "clean", "-fd", "--quiet", cwd=repo_dir)
     else:
-        console.print(f"  [cyan]{repo:<16}[/] cloning...", end="\r")
+        ref_label = f"PR #{pr}" if pr is not None else "master"
+        console.print(f"  [cyan]{repo:<16}[/] cloning ({ref_label})...", end="\r")
         sh("git", "clone", "--quiet", upstream_url, str(repo_dir))
         sh("git", "remote", "rename", "origin", "upstream", cwd=repo_dir)
         sh("git", "remote", "add", "origin", fork_url, cwd=repo_dir)
+    _checkout_release_ref(repo_dir, pr=pr)
     console.print(f"  [cyan]{repo:<16}[/] ready     ")
+
+
+def _checkout_release_ref(repo_dir: Path, *, pr: int | None) -> None:
+    """Reset *repo_dir* to ``upstream/master`` (or *pr*'s head ref).
+
+    Splits the actual checkout out of [`ensure_clone`][ensure_clone] so
+    re-running with a different *pr* on a cached clone works without
+    needing the full sync.  Falls back to ``upstream/master`` when
+    *pr* is ``None`` so a mixed run (some packages with PRs, others
+    without) lands every clone on the right ref.
+    """
+    if pr is not None:
+        ref = f"refs/pull/{pr}/head"
+        sh(
+            "git", "fetch", "upstream", "--quiet", "--force",
+            f"{ref}:refs/remotes/upstream/pr-{pr}",
+            cwd=repo_dir,
+        )  # fmt: skip
+        sh("git", "reset", "--hard", f"upstream/pr-{pr}", "-q", cwd=repo_dir)
+    else:
+        sh("git", "reset", "--hard", "upstream/master", "-q", cwd=repo_dir)
+    sh("git", "clean", "-fd", "--quiet", cwd=repo_dir)
 
 
 # ── GitHub ops ────────────────────────────────────────────────────────────
@@ -2136,15 +2166,22 @@ def quick(
     if not release_name and not pretend:
         release_name = alert_prompt("Release name (empty for version-only)", default="")
 
+    # Extract PR overrides up front so the clone-cache lands each repo
+    # on the right ref before dep-graph verification reads its
+    # pyproject.toml — checking against ``upstream/master`` for a repo
+    # whose PR introduces a new sibling dep would always false-positive.
+    pr_specs = {repo: pr for repo, pr in parse_chain_spec(chain_spec) if pr is not None}
+
     # Clone the WHOLE family up front so gap detection and dep validation
     # run on the verified live dep graph — a stale vendored ``DEPS`` would
     # otherwise miss a pyproject mismatch on a repo not in this run.
     console.print("\n[bold]Syncing clones...[/]")
     for repo in CHAIN:
-        ensure_clone(repo, cd, org, fork)
+        ensure_clone(repo, cd, org, fork, pr=pr_specs.get(repo))
     live_deps = _verify_dep_graph(CHAIN, cd)
 
-    chain, stop_at, pr_specs = _resolve_chain(chain_spec, live_deps, open_top=open_top)
+    chain, stop_at, _pr_specs = _resolve_chain(chain_spec, live_deps, open_top=open_top)
+    assert _pr_specs == pr_specs  # invariant: both extractions agree
 
     target, prerelease, version_step_uniform = _resolve_alpha_constraints(
         version_step, target, prerelease, version_step_uniform
@@ -2344,13 +2381,19 @@ def plan_cmd(
             "[yellow]Warning: no release name (-n). Release titles will be version-only.[/]"
         )
 
+    # Extract PR overrides up front so the clone-cache lands each repo
+    # on the right ref before dep-graph verification reads its
+    # pyproject.toml (see ``quick`` for the full rationale).
+    pr_specs = {repo: pr for repo, pr in parse_chain_spec(chain_spec) if pr is not None}
+
     # Clone the WHOLE family up front so gap detection and dep validation
     # run on the verified live dep graph (see ``quick`` for the rationale).
     for repo in CHAIN:
-        ensure_clone(repo, cd, org, fork)
+        ensure_clone(repo, cd, org, fork, pr=pr_specs.get(repo))
     live_deps = _verify_dep_graph(CHAIN, cd)
 
-    chain, stop_at, pr_specs = _resolve_chain(chain_spec, live_deps, open_top=open_top)
+    chain, stop_at, _pr_specs = _resolve_chain(chain_spec, live_deps, open_top=open_top)
+    assert _pr_specs == pr_specs  # invariant: both extractions agree
 
     target, prerelease, version_step_uniform = _resolve_alpha_constraints(
         version_step, target, prerelease, version_step_uniform
