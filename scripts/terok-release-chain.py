@@ -29,12 +29,20 @@ Publish targets (``--target``):
                      TestPyPI instead
     gh-only          GitHub Release only, no PyPI/TestPyPI
 
+Version steps:
+    Every package released in a single run bumps at the same level
+    (``--version-step``, default ``patch``).  A chain release is one
+    coordinated unit, so a mixed-level run — where the level reflects
+    each package's own API delta — would need a per-package decision the
+    chain can't infer; if that's ever needed, pass an explicit level per
+    package rather than relying on position.
+
 Dev-cycle integration tags (``--version-step=alpha``):
     Cuts ``vX.Y.ZaN`` pre-release tags between real PyPI releases so a
     cross-repo PR chain can pin to tagged wheels on master instead of
-    git-branch refs.  Always implies ``--target=gh-only``, the GH
-    prerelease flag, and uniform chain-wide bumps (lower repos go
-    ``X.Y.Z`` → ``X.Y.(Z+1)a1`` too, not silently to final).  Promote
+    git-branch refs.  Always implies ``--target=gh-only`` and the GH
+    prerelease flag; with the uniform bump every repo goes ``X.Y.Z`` →
+    ``X.Y.(Z+1)a1`` rather than silently promoting to final.  Promote
     to a real release at the end of the cycle with a plain ``--version-
     step=patch`` — the alpha suffix is dropped and PyPI publish resumes.
 
@@ -1331,7 +1339,6 @@ def generate_plan(
     fork: str,
     release_name: str,
     version_step: str,
-    uniform: bool,
     cache_dir: Path,
     stop_at: str | None = None,
     upgrade_pinned: bool = False,
@@ -1354,7 +1361,7 @@ def generate_plan(
     released: ReleasedVersions = {}
     planned_pins: dict[str, str] = {}
 
-    for i, repo in enumerate(chain):
+    for repo in chain:
         current = latest_version(repo, org)
         gh_repo = f"{org}/{repo}"
         repo_dir = cache_dir / repo
@@ -1384,8 +1391,8 @@ def generate_plan(
         else:
             action = Action.RELEASE_MASTER
 
-        level = version_step if (i == 0 or uniform) else "patch"
-        new_ver = bump_version(current, level) if action != Action.DEPS_ONLY else None
+        # Uniform chain-wide: every released package bumps at the same level.
+        new_ver = bump_version(current, version_step) if action != Action.DEPS_ONLY else None
 
         repo_deps = live_deps[repo]
         sibling_deps: SiblingVersions = {}
@@ -2055,7 +2062,6 @@ _chain_options = _stack(
             "promote (drop the suffix)."
         ),
     ),
-    click.option("--version-step-uniform", is_flag=True),
     click.option("-n", "--name", "release_name", default="", help="Release name suffix"),
     click.option("--upgrade-pinned", is_flag=True),
     click.option("--open-top", is_flag=True, help="Top package: update deps only, no release"),
@@ -2085,23 +2091,23 @@ _chain_options = _stack(
 
 
 def _resolve_alpha_constraints(
-    version_step: str, target: str, prerelease: bool, uniform: bool
-) -> tuple[str, bool, bool]:
+    version_step: str, target: str, prerelease: bool
+) -> tuple[str, bool]:
     """Apply ``--version-step=alpha`` implications.
 
-    Alpha tags are dev-cycle integration artefacts: always gh-only,
-    always GH prereleases, always uniform across the chain so lower
-    repos don't accidentally promote to final mid-cycle.  Explicit
-    pypi/testpypi targets are rejected up front.
+    Alpha tags are dev-cycle integration artefacts: always gh-only and
+    always GH prereleases.  Bumps are uniform chain-wide regardless of
+    step, so lower repos take the alpha bump too rather than promoting to
+    final mid-cycle.  Explicit pypi/testpypi targets are rejected up front.
     """
     if version_step != "alpha":
-        return target, prerelease, uniform
+        return target, prerelease
     if target in ("pypi", "testpypi"):
         die(
             f"--version-step=alpha is incompatible with --target={target} — "
             "alpha tags are gh-only by design. Drop the suffix to publish to PyPI."
         )
-    return "gh-only", True, True
+    return "gh-only", True
 
 
 def _resolve_pin_style(pin_style: str | None, target: str) -> str:
@@ -2137,7 +2143,6 @@ def cli():
 def quick(
     chain_spec,
     version_step,
-    version_step_uniform,
     release_name,
     upgrade_pinned,
     open_top,
@@ -2202,9 +2207,7 @@ def quick(
     chain, stop_at, _pr_specs = _resolve_chain(chain_spec, live_deps, open_top=open_top)
     assert _pr_specs == pr_specs  # invariant: both extractions agree
 
-    target, prerelease, version_step_uniform = _resolve_alpha_constraints(
-        version_step, target, prerelease, version_step_uniform
-    )
+    target, prerelease = _resolve_alpha_constraints(version_step, target, prerelease)
     pin_style = _resolve_pin_style(pin_style, target)
     plan = generate_plan(
         chain,
@@ -2213,7 +2216,6 @@ def quick(
         fork=fork,
         release_name=release_name,
         version_step=version_step,
-        uniform=version_step_uniform,
         cache_dir=cd,
         stop_at=stop_at,
         upgrade_pinned=upgrade_pinned,
@@ -2378,7 +2380,6 @@ def open_chain(branch, repos, pretend, org, fork, cache_dir):
 def plan_cmd(
     chain_spec,
     version_step,
-    version_step_uniform,
     release_name,
     upgrade_pinned,
     open_top,
@@ -2415,9 +2416,7 @@ def plan_cmd(
     chain, stop_at, _pr_specs = _resolve_chain(chain_spec, live_deps, open_top=open_top)
     assert _pr_specs == pr_specs  # invariant: both extractions agree
 
-    target, prerelease, version_step_uniform = _resolve_alpha_constraints(
-        version_step, target, prerelease, version_step_uniform
-    )
+    target, prerelease = _resolve_alpha_constraints(version_step, target, prerelease)
     pin_style = _resolve_pin_style(pin_style, target)
     plan = generate_plan(
         chain,
@@ -2426,7 +2425,6 @@ def plan_cmd(
         fork=fork,
         release_name=release_name,
         version_step=version_step,
-        uniform=version_step_uniform,
         cache_dir=cd,
         stop_at=stop_at,
         upgrade_pinned=upgrade_pinned,
