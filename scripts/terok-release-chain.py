@@ -1920,28 +1920,36 @@ def _gap_pairs(resolved: list[str], graph: DepGraph) -> list[tuple[str, str]]:
     return gaps
 
 
-# Steps that touch the outside world in a hard-to-undo way — flagged in the
-# tree so the operator sees exactly where the plan stops being recoverable.
-# ``git_push`` is deliberately excluded: a force-with-lease to a fork branch
-# is trivially reversible, so flagging it would only dilute the signal.
-_IRREVERSIBLE_STEPS = frozenset(
-    {
-        StepKind.PR_MERGE,
-        StepKind.TAG,
-        StepKind.RELEASE,
-        StepKind.WORKFLOW_DISPATCH,
-    }
-)
+# Steps an operator can't cleanly walk back — flagged in the tree.
+#   - PR_MERGE lands on master; undoing it takes another commit, the
+#     hardest of these to reverse cleanly.
+#   - WORKFLOW_DISPATCH uploads to PyPI/TestPyPI, where a version number,
+#     once published, can never be reused — genuinely unrecoverable.
+# TAG and RELEASE are intentionally *not* flagged: until the PyPI upload an
+# upstream admin can still delete the tag, or the release and its wheel.
+# GIT_PUSH is excluded for the same reason — a force-with-lease to a fork
+# branch is trivial to redo.
+_IRREVERSIBLE_STEPS = frozenset({StepKind.PR_MERGE, StepKind.WORKFLOW_DISPATCH})
+
+# Human names for the publish targets, echoed on the dispatch line so the
+# operator sees *where* the unrecoverable upload lands.
+_PUBLISH_ENV = {"pypi": "PyPI", "testpypi": "TestPyPI"}
 
 
-def _step_line(step: Step) -> str:
-    """One colourised line describing a step for the plan tree."""
+def _step_line(step: Step, target: str) -> str:
+    """One colourised line describing a step for the plan tree.
+
+    *target* is the plan's publish target — named explicitly on the
+    ``workflow_dispatch`` line, since that step is the upload to PyPI /
+    TestPyPI and thus the point of no return.
+    """
     p = step.params
-    detail = (
-        f"{p['dep_repo']} v{p['dep_version']}"
-        if step.kind == StepKind.DEP_UPDATE
-        else p.get("version") or p.get("tag") or p.get("branch") or ""
-    )
+    if step.kind == StepKind.WORKFLOW_DISPATCH:
+        detail = f"publish → {_PUBLISH_ENV.get(target, target)}"
+    elif step.kind == StepKind.DEP_UPDATE:
+        detail = f"{p['dep_repo']} v{p['dep_version']}"
+    else:
+        detail = p.get("version") or p.get("tag") or p.get("branch") or ""
     detail_hint = f" [dim]{detail}[/]" if detail else ""
     flag = " [bold red]⚠ irreversible[/]" if step.kind in _IRREVERSIBLE_STEPS else ""
     return f"{step.kind.value}{detail_hint}{flag}"
@@ -1963,7 +1971,7 @@ def _render_plan_steps(plan: Plan) -> None:
         ver = f" [green]v{pkg.new_version}[/]" if pkg.new_version else " [dim](deps only)[/]"
         branch = tree.add(f"[cyan]{pkg.repo}[/]{ver}")
         for step in steps:
-            branch.add(_step_line(step))
+            branch.add(_step_line(step, plan.target))
     console.print(tree)
 
 
