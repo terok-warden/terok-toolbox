@@ -55,7 +55,6 @@ Usage:
     terok-release quick sandbox..terok --version-step=alpha
     terok-release open feat/comms clearance
     terok-release plan sandbox..terok -o plan.json
-    terok-release simulate plan.json
     terok-release execute plan.json
 """
 
@@ -81,6 +80,7 @@ import tomlkit
 from pydantic import VERSION as _pydantic_ver, BaseModel, Field
 from rich.console import Console
 from rich.table import Table
+from rich.tree import Tree
 
 if int(_pydantic_ver.split(".")[0]) < 2:
     raise SystemExit(f"pydantic >= 2 required (found {_pydantic_ver}): pip install 'pydantic>=2'")
@@ -898,9 +898,6 @@ def wait_for_checks(pr_url: str, gh_repo: str, ctx: Ctx) -> str:
     if ctx.skip_checks:
         console.print("[yellow]Skipping CI checks[/]")
         return "passed"
-    if ctx.dry_run:
-        console.print(f"[yellow][pretend][/] Would wait for checks on {pr_url}")
-        return "passed"
 
     console.print(f"Waiting for PR checks (timeout {ctx.check_timeout}s)...")
 
@@ -1078,13 +1075,7 @@ def wait_for_release_run(gh_repo: str, run_id: str, ref: str, ctx: "Ctx") -> Non
     edit URL alongside the approval URL turns "waiting for approval"
     into a deliberate review-and-edit-and-approve checkpoint per
     package — exactly what publishing to PyPI deserves.
-
-    Honors ``ctx.dry_run`` to stay silent when not interactive.
     """
-    if ctx.dry_run:
-        console.print(f"[yellow][pretend][/] Would watch run {run_id} on {gh_repo}")
-        return
-
     alerted = False
     last_status: str | None = None
     approval_url = f"https://github.com/{gh_repo}/actions/runs/{run_id}"
@@ -1278,7 +1269,7 @@ def edit_notes(plan: Plan) -> None:
     / agent-mode runs to make the editor a no-op so the seeded notes ship
     as-is.
     """
-    import click as _click  # lazy: editor not needed for plan/simulate/execute
+    import click as _click  # lazy: editor not needed for plan/execute
 
     for pkg in plan.packages:
         if pkg.notes_path and Path(pkg.notes_path).exists():
@@ -1708,39 +1699,6 @@ def execute_step(step: Step, plan: Plan, ctx: Ctx):
             wait_for_pypi(step.package, p["version"], plan.target, ctx.pypi_timeout)
 
 
-def simulate_step(step: Step, plan: Plan, ctx: Ctx):
-    """Dry-run one step: verify preconditions, log the intent, no side effects."""
-    p = step.params
-    match step.kind:
-        case StepKind.CLONE_SYNC:
-            ensure_clone(step.package, ctx.cache_dir, plan.gh_org, plan.gh_fork)
-        case StepKind.DEP_UPDATE:
-            released_in_plan = {pkg.repo for pkg in plan.packages if pkg.new_version}
-            if p["dep_repo"] not in released_in_plan:
-                r = sh(
-                    "gh",
-                    "release",
-                    "view",
-                    f"v{p['dep_version']}",
-                    "--repo",
-                    f"{plan.gh_org}/{p['dep_repo']}",
-                    "--json",
-                    "assets",
-                    "-q",
-                    ".assets[].name",
-                    capture=True,
-                    check=False,
-                )
-                expected = wheel_filename(p["dep_repo"], p["dep_version"])
-                if expected not in (r.stdout or ""):
-                    console.print(f"[yellow]Warning: wheel {expected} not found[/]")
-        case StepKind.PR_MERGE:
-            step.result["merge_sha"] = "(simulated)"
-        case _:
-            pass
-    console.print(f"[yellow][simulate][/] {step.id}: {step.kind.value} {p}")
-
-
 def save_plan(plan: Plan, path: Path):
     """Snapshot the plan to disk so a crashed run can resume from where it failed."""
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -1748,8 +1706,6 @@ def save_plan(plan: Plan, path: Path):
 
 
 class ExecMode(StrEnum):
-    SIMULATE = "simulate"
-    """Log intent + validate preconditions, no side effects."""
     EXECUTE = "execute"
     """Run every step from scratch."""
     RESUME = "resume"
@@ -1779,31 +1735,27 @@ def execute_plan(plan: Plan, *, mode: ExecMode, ctx: Ctx) -> Plan:
             last_pkg = step.package
         console.print(f"  [dim]{step.kind.value}[/]")
 
-        if mode == ExecMode.SIMULATE:
-            simulate_step(step, plan, ctx)
+        step.status = "running"
+        if ctx.plan_path:
+            save_plan(plan, ctx.plan_path)
+        try:
+            execute_step(step, plan, ctx)
             step.status = "completed"
-        else:
-            step.status = "running"
+        except (subprocess.CalledProcessError, SystemExit) as exc:
+            step.status = "failed"
+            step.result["error"] = str(exc)
             if ctx.plan_path:
                 save_plan(plan, ctx.plan_path)
-            try:
-                execute_step(step, plan, ctx)
-                step.status = "completed"
-            except (subprocess.CalledProcessError, SystemExit) as exc:
-                step.status = "failed"
-                step.result["error"] = str(exc)
-                if ctx.plan_path:
-                    save_plan(plan, ctx.plan_path)
-                    console.print(f"[red]Plan state saved:[/] {ctx.plan_path}")
-                    console.print(
-                        f"[red]Resume with: terok-release execute {ctx.plan_path}[/]"
-                    )
-                pkg = _package(plan, step.package)
-                if pkg.pr_url:
-                    console.print(f"[red]Step operated on:[/] {pkg.pr_url}")
-                raise
-            if ctx.plan_path:
-                save_plan(plan, ctx.plan_path)
+                console.print(f"[red]Plan state saved:[/] {ctx.plan_path}")
+                console.print(
+                    f"[red]Resume with: terok-release execute {ctx.plan_path}[/]"
+                )
+            pkg = _package(plan, step.package)
+            if pkg.pr_url:
+                console.print(f"[red]Step operated on:[/] {pkg.pr_url}")
+            raise
+        if ctx.plan_path:
+            save_plan(plan, ctx.plan_path)
     return plan
 
 
@@ -1947,6 +1899,53 @@ def _gap_pairs(resolved: list[str], graph: DepGraph) -> list[tuple[str, str]]:
     return gaps
 
 
+# Steps that touch the outside world in a hard-to-undo way — flagged in the
+# tree so the operator sees exactly where the plan stops being recoverable.
+# ``git_push`` is deliberately excluded: a force-with-lease to a fork branch
+# is trivially reversible, so flagging it would only dilute the signal.
+_IRREVERSIBLE_STEPS = frozenset(
+    {
+        StepKind.PR_MERGE,
+        StepKind.TAG,
+        StepKind.RELEASE,
+        StepKind.WORKFLOW_DISPATCH,
+    }
+)
+
+
+def _step_line(step: Step) -> str:
+    """One colourised line describing a step for the plan tree."""
+    p = step.params
+    detail = (
+        f"{p['dep_repo']} v{p['dep_version']}"
+        if step.kind == StepKind.DEP_UPDATE
+        else p.get("version") or p.get("tag") or p.get("branch") or ""
+    )
+    detail_hint = f" [dim]{detail}[/]" if detail else ""
+    flag = " [bold red]⚠ irreversible[/]" if step.kind in _IRREVERSIBLE_STEPS else ""
+    return f"{step.kind.value}{detail_hint}{flag}"
+
+
+def _render_plan_steps(plan: Plan) -> None:
+    """Per-step tree grouped by package — the step-level companion to the
+    summary table, and the honest replacement for the old dry run's
+    step-by-step echo.  Shows *what will run*, not a mocked *what ran*.
+    """
+    by_pkg: dict[str, list[Step]] = {}
+    for step in plan.steps:
+        by_pkg.setdefault(step.package, []).append(step)
+    tree = Tree("[bold]Steps[/]")
+    for pkg in plan.packages:
+        steps = by_pkg.get(pkg.repo, [])
+        if not steps:
+            continue
+        ver = f" [green]v{pkg.new_version}[/]" if pkg.new_version else " [dim](deps only)[/]"
+        branch = tree.add(f"[cyan]{pkg.repo}[/]{ver}")
+        for step in steps:
+            branch.add(_step_line(step))
+    console.print(tree)
+
+
 def _render_plan_preview(plan: Plan) -> None:
     """Print the plan as a table — the operator's last look before we commit."""
     kind_hint = "[yellow]prerelease[/]" if plan.prerelease else "[green]release[/]"
@@ -1975,6 +1974,7 @@ def _render_plan_preview(plan: Plan) -> None:
         action = pkg.action.value + (f" #{pkg.pr_number}" if pkg.pr_number else "")
         table.add_row(str(i), pkg.repo, action, ver, dep_str)
     console.print(table)
+    _render_plan_steps(plan)
     notes = [pkg.notes_path for pkg in plan.packages if pkg.notes_path]
     if notes:
         console.print(
@@ -2137,7 +2137,6 @@ def cli():
 @cli.command(context_settings=_CLICK_CONTEXT)
 @_chain_options
 @click.option("-y", "--yes", is_flag=True, help="Auto-approve normal confirmations")
-@click.option("-p", "--pretend", is_flag=True, help="Dry run")
 @click.option("--skip-checks", is_flag=True)
 @click.option("--check-timeout", default=DEFAULT_CHECK_TIMEOUT, type=int)
 def quick(
@@ -2153,7 +2152,6 @@ def quick(
     fork,
     cache_dir,
     yes,
-    pretend,
     skip_checks,
     check_timeout,
 ):
@@ -2183,10 +2181,10 @@ def quick(
       quick clearance,sandbox:221..terok  mixed; literal union
       quick sandbox..terok --prerelease   prerelease badge on each
     """
-    org, fork, cd, ctx = _common_ctx(org, fork, cache_dir, pretend, yes, skip_checks, check_timeout)
+    org, fork, cd, ctx = _common_ctx(org, fork, cache_dir, False, yes, skip_checks, check_timeout)
 
     # Prompt for release name if not given
-    if not release_name and not pretend:
+    if not release_name:
         release_name = alert_prompt("Release name (empty for version-only)", default="")
 
     # Extract PR overrides up front so the clone-cache lands each repo
@@ -2228,7 +2226,7 @@ def quick(
 
     _render_plan_preview(plan)
 
-    if not pretend and not yes:
+    if not yes:
         # Default-N because the interactive operator usually wants to edit;
         # plain Enter opens $EDITOR.  ``-y`` skips the prompt entirely and
         # ships the seeded notes as-is, which matches ``-y``'s "auto-accept
@@ -2250,14 +2248,12 @@ def quick(
     console.print(f"[dim]Resume on failure: terok-release execute {plan_path}[/]")
 
     # Execute
-    mode = ExecMode.SIMULATE if pretend else ExecMode.EXECUTE
     start_ts = time.monotonic()
-    execute_plan(plan, mode=mode, ctx=ctx)
+    execute_plan(plan, mode=ExecMode.EXECUTE, ctx=ctx)
     elapsed = time.monotonic() - start_ts
 
     # Summary
-    prefix = "[yellow][pretend][/] " if pretend else ""
-    console.print(f"\n{prefix}[bold green]All releases complete![/]\n")
+    console.print("\n[bold green]All releases complete![/]\n")
     for pkg in plan.packages:
         if pkg.new_version:
             url = published_url(plan.target, plan.gh_org, pkg.repo, pkg.new_version)
@@ -2435,26 +2431,12 @@ def plan_cmd(
     )
     seed_notes(plan, cd)
 
+    _render_plan_preview(plan)
+
     out = Path(output) if output else cd / "plans" / f"{datetime.now():%Y%m%d-%H%M%S}.json"
     save_plan(plan, out)
-    console.print(f"Plan written to {out}")
-    for pkg in plan.packages:
-        if pkg.notes_path:
-            console.print(f"  [dim]notes:[/] {pkg.notes_path}")
-
-
-@cli.command(context_settings=_CLICK_CONTEXT)
-@click.argument("plan_file", type=click.Path(exists=True))
-@_remote_options
-def simulate(plan_file, org, fork, cache_dir):
-    """Validate a plan against real repo state."""
-    org, fork, cd, ctx = _common_ctx(org, fork, cache_dir, True, True, True, 0)
-    plan = Plan.model_validate_json(Path(plan_file).read_text())
-    # Fall back to plan-embedded values when CLI/env didn't provide them
-    plan.gh_org = org or plan.gh_org
-    plan.gh_fork = fork or plan.gh_fork
-    execute_plan(plan, mode=ExecMode.SIMULATE, ctx=ctx)
-    console.print("\n[green]Simulation complete — no issues found.[/]")
+    console.print(f"\nPlan written to {out}")
+    console.print(f"[dim]Execute when ready: terok-release execute {out}[/]")
 
 
 @cli.command(context_settings=_CLICK_CONTEXT)
