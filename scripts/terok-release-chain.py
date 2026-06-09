@@ -55,6 +55,7 @@ Usage:
     terok-release quick sandbox..terok --version-step=alpha
     terok-release open feat/comms clearance
     terok-release plan sandbox..terok -o plan.json
+    terok-release show plan.json
     terok-release execute plan.json
 """
 
@@ -152,7 +153,7 @@ MERGE_RACE_POLL_INTERVAL = 2
 
 RELEASE_BRANCH_PREFIX = "chore/release-"
 BUMP_DEPS_BRANCH_PREFIX = "chore/bump-deps"
-RELEASE_COMMIT_PREFIX = "chore: release"
+RELEASE_COMMIT_PREFIX = "release:"
 BUMP_DEPS_COMMIT = "chore: bump sibling deps"
 AUTOMATED_RELEASE_LABEL = "automated-release"
 
@@ -1947,9 +1948,9 @@ def _step_line(step: Step) -> str:
 
 
 def _render_plan_steps(plan: Plan) -> None:
-    """Per-step tree grouped by package — the step-level companion to the
-    summary table, and the honest replacement for the old dry run's
-    step-by-step echo.  Shows *what will run*, not a mocked *what ran*.
+    """Per-step tree grouped by package — the detailed view behind the
+    ``show`` verb.  Shows *what will run*, step by step, rather than the
+    summary table's one-row-per-package overview.
     """
     by_pkg: dict[str, list[Step]] = {}
     for step in plan.steps:
@@ -1994,7 +1995,6 @@ def _render_plan_preview(plan: Plan) -> None:
         action = pkg.action.value + (f" #{pkg.pr_number}" if pkg.pr_number else "")
         table.add_row(str(i), pkg.repo, action, ver, dep_str)
     console.print(table)
-    _render_plan_steps(plan)
     notes = [pkg.notes_path for pkg in plan.packages if pkg.notes_path]
     if notes:
         console.print(
@@ -2451,12 +2451,24 @@ def plan_cmd(
     )
     seed_notes(plan, cd)
 
-    _render_plan_preview(plan)
-
     out = Path(output) if output else cd / "plans" / f"{datetime.now():%Y%m%d-%H%M%S}.json"
     save_plan(plan, out)
-    console.print(f"\nPlan written to {out}")
-    console.print(f"[dim]Execute when ready: terok-release execute {out}[/]")
+    console.print(f"Plan written to {out}")
+    console.print(f"[dim]View it:    terok-release show {out}[/]")
+    console.print(f"[dim]Execute it: terok-release execute {out}[/]")
+
+
+@cli.command(context_settings=_CLICK_CONTEXT)
+@click.argument("plan_file", type=click.Path(exists=True))
+def show(plan_file):
+    """Display a saved plan: summary table + per-step tree.
+
+    Pure rendering of the plan JSON — reads nothing from GitHub and runs
+    no steps, so it needs neither org/fork nor a clone cache.
+    """
+    plan = Plan.model_validate_json(Path(plan_file).read_text())
+    _render_plan_preview(plan)
+    _render_plan_steps(plan)
 
 
 @cli.command(context_settings=_CLICK_CONTEXT)
