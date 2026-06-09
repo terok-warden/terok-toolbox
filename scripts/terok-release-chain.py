@@ -275,6 +275,7 @@ class StepKind(StrEnum):
     GIT_COMMIT = "git_commit"
     GIT_PUSH = "git_push"
     PR_CREATE = "pr_create"
+    PR_LABEL = "pr_label"
     PR_MERGE = "pr_merge"
     TAG = "tag"
     RELEASE = "release"
@@ -1206,6 +1207,12 @@ def plan_steps(
         branch=branch,
         **({"source": "pr"} if pkg.pr_branch else {"base": "upstream/master"}),
     )
+    # Releasing from an existing PR: stamp it with the CodeRabbit skip
+    # label *before* the bump commit is pushed, so the auto-review that
+    # the push would otherwise trigger never fires.  Freshly-opened
+    # release PRs get the same label at PR_CREATE time instead.
+    if pkg.action == Action.RELEASE_PR:
+        add(StepKind.PR_LABEL, label=AUTOMATED_RELEASE_LABEL)
     for dep, ver in pkg.sibling_deps.items():
         add(StepKind.DEP_UPDATE, dep_repo=dep, dep_version=ver, pin_style=pin_style)
     if do_release:
@@ -1604,6 +1611,19 @@ def execute_step(step: Step, plan: Plan, ctx: Ctx):
             # Mirror onto the PackagePlan so the per-package banner, exception
             # handler, and end-of-run summary can all read URLs from one place.
             _package(plan, step.package).pr_url = url
+
+        case StepKind.PR_LABEL:
+            # Idempotent: ``--add-label`` is a no-op when the label is
+            # already present (a re-run, or a PR opened by an earlier
+            # PR_CREATE).  The label must already exist in the repo —
+            # the same prerequisite PR_CREATE relies on.
+            pr_url = _find_pr_url(step.package, plan)
+            sh(
+                "gh", "pr", "edit", pr_url,
+                "--repo", gh_repo,
+                "--add-label", p["label"],
+            )  # fmt: skip
+            console.print(f"Labelled {pr_url} → {p['label']}")
 
         case StepKind.PR_MERGE:
             if _branch_matches_upstream(repo_dir):
