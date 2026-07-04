@@ -10,9 +10,11 @@ GitHub-prerelease releases, master and from-PR sources, and any mix.
 Chain spec grammar (positional arg to ``quick`` and ``plan``):
     pkg              one package (equivalent to ``pkg..pkg``)
     pkg:NUM          release pkg from PR #NUM
+    pkg%LEVEL        bump pkg at LEVEL instead of --version-step
     A..B             range; intermediates filled from CHAIN order
+    A..B%LEVEL       range; every expanded package bumps at LEVEL
     A,B,C            literal list — released exactly as named, no cascade
-    A,B:NUM..C       any combination
+    A,B:NUM%LEVEL..C any combination
 
 Selection is literal: a bare name or comma-list is taken at face value.
 For a full cascade through dependents, use a range (``sandbox..terok``).
@@ -30,19 +32,22 @@ Publish targets (``--target``):
     gh-only          GitHub Release only, no PyPI/TestPyPI
 
 Version steps:
-    Every package released in a single run bumps at the same level
-    (``--version-step``, default ``patch``).  A chain release is one
-    coordinated unit, so a mixed-level run — where the level reflects
-    each package's own API delta — would need a per-package decision the
-    chain can't infer; if that's ever needed, pass an explicit level per
-    package rather than relying on position.
+    ``--version-step`` (default ``patch``) sets the bump level for every
+    released package; a ``%LEVEL`` suffix in the chain spec overrides it
+    per package.  The level reflects each package's own API delta, which
+    the chain can't infer — spell it out wherever it differs from the
+    run's default.  A suffix on a range applies to every package the
+    range expands to; for per-package granularity inside a range, write
+    the literal list instead.
 
 Dev-cycle integration tags (``--version-step=alpha``):
     Cuts ``vX.Y.ZaN`` pre-release tags between real PyPI releases so a
     cross-repo PR chain can pin to tagged wheels on master instead of
     git-branch refs.  Always implies ``--target=gh-only`` and the GH
-    prerelease flag; with the uniform bump every repo goes ``X.Y.Z`` →
-    ``X.Y.(Z+1)a1`` rather than silently promoting to final.  Promote
+    prerelease flag; every repo goes ``X.Y.Z`` → ``X.Y.(Z+1)a1`` rather
+    than silently promoting to final.  Alpha is all-or-nothing: those
+    plan-wide implications can't hold for half a run, so mixing ``alpha``
+    with final levels via ``%LEVEL`` overrides is rejected.  Promote
     to a real release at the end of the cycle with a plain ``--version-
     step=patch`` — the alpha suffix is dropped and PyPI publish resumes.
 
@@ -51,6 +56,7 @@ Usage:
     terok-release quick sandbox..terok --open-top
     terok-release quick sandbox:42,executor:55,terok:706 --open-top
     terok-release quick clearance,sandbox:221..terok
+    terok-release quick util..shield%minor,executor:412%patch,terok%patch
     terok-release quick mkdocs --target=testpypi
     terok-release quick sandbox..terok --version-step=alpha
     terok-release open feat/comms clearance
@@ -74,7 +80,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
-from typing import Any, Never
+from typing import Any, NamedTuple, Never
 
 import click
 import tomlkit
@@ -181,6 +187,10 @@ def slugify(text: str) -> str:
 
 _VER_RE = re.compile(r"^(\d+)\.(\d+)\.(\d+)(?:a(\d+))?$")
 
+# The bump levels ``--version-step`` accepts — and, prefixed with ``%``,
+# the per-package overrides the chain spec accepts.
+VERSION_STEPS = ("major", "minor", "patch", "alpha")
+
 
 def bump_version(ver: str, level: str = "patch") -> str:
     """``X.Y.Z`` or ``X.Y.ZaN`` → next version at the given level.
@@ -258,6 +268,9 @@ type SiblingVersions = dict[str, str]
 
 # Package → GitHub PR number (the release-from-PR workflow).
 type PrSpecs = dict[str, int]
+
+# Package → bump level from a chain-spec ``%LEVEL`` override.
+type LevelSpecs = dict[str, str]
 
 # Package → new version string, for packages already processed in this run.
 type ReleasedVersions = dict[str, str]
@@ -1342,6 +1355,7 @@ def generate_plan(
     stop_at: str | None = None,
     upgrade_pinned: bool = False,
     pr_specs: PrSpecs | None = None,
+    level_specs: LevelSpecs | None = None,
     prerelease: bool = False,
     target: str = "pypi",
     pin_style: str = "pypi",
@@ -1390,8 +1404,9 @@ def generate_plan(
         else:
             action = Action.RELEASE_MASTER
 
-        # Uniform chain-wide: every released package bumps at the same level.
-        new_ver = bump_version(current, version_step) if action != Action.DEPS_ONLY else None
+        # Chain-wide default, overridden where the spec says ``%LEVEL``.
+        level = (level_specs or {}).get(repo, version_step)
+        new_ver = bump_version(current, level) if action != Action.DEPS_ONLY else None
 
         repo_deps = live_deps[repo]
         sibling_deps: SiblingVersions = {}
@@ -1843,6 +1858,14 @@ def _common_ctx(
     )
 
 
+class ChainEntry(NamedTuple):
+    """One package resolved from the chain spec, with its per-entry overrides."""
+
+    repo: str
+    pr: int | None
+    level: str | None
+
+
 def _parse_endpoint(s: str) -> tuple[str, int | None]:
     """Parse one ``pkg`` or ``pkg:PR`` token from a chain spec."""
     if ":" in s:
@@ -1854,34 +1877,56 @@ def _parse_endpoint(s: str) -> tuple[str, int | None]:
     return normalise(s.strip()), None
 
 
-def parse_chain_spec(spec: str) -> list[tuple[str, int | None]]:
-    """Parse a chain spec into ordered ``(repo, pr_or_None)`` entries.
+def _split_level(part: str) -> tuple[str, str | None]:
+    """Strip the optional trailing ``%LEVEL`` off one comma-part of a chain spec.
 
-    Grammar: ``pkg[:PR]`` entries combined with ``,`` and ``..``.  A range
-    fills intermediate packages from ``CHAIN`` order (each as bare master).
-    Each entry tracks its own PR override; duplicates raise.
+    The suffix goes at the end of the whole part — after the PR number,
+    after the range end.  A ``%`` anywhere else (``a%minor..b``) leaves
+    range syntax inside the would-be level and fails validation here.
     """
-    entries: list[tuple[str, int | None]] = []
+    if "%" not in part:
+        return part, None
+    rest, level = part.rsplit("%", 1)
+    if level not in VERSION_STEPS:
+        die(
+            f"Bad bump level in '{part}': %LEVEL must end the entry, "
+            f"LEVEL one of {', '.join(VERSION_STEPS)}"
+        )
+    return rest, level
+
+
+def parse_chain_spec(spec: str) -> list[ChainEntry]:
+    """Parse a chain spec into ordered ``ChainEntry`` items.
+
+    Grammar: ``pkg[:PR]`` entries combined with ``,`` and ``..``, each
+    comma-part optionally ending in ``%LEVEL``.  A range fills intermediate
+    packages from ``CHAIN`` order (each as bare master); its ``%LEVEL``
+    applies to every package it expands to.  Each entry tracks its own
+    PR override; duplicates raise.
+    """
+    entries: list[ChainEntry] = []
     seen: set[str] = set()
 
-    def add(repo: str, pr: int | None) -> None:
+    def add(repo: str, pr: int | None, level: str | None) -> None:
         if repo in seen:
             die(f"Duplicate package in chain spec: {repo}")
-        entries.append((repo, pr))
+        entries.append(ChainEntry(repo, pr, level))
         seen.add(repo)
 
-    for part in (p.strip() for p in spec.split(",")):
-        if not part:
+    for raw in (p.strip() for p in spec.split(",")):
+        if not raw:
             die(f"Empty entry in chain spec: '{spec}'")
+        part, level = _split_level(raw)
         if ".." in part:
             start_s, end_s = part.split("..", 1)
             start_repo, start_pr = _parse_endpoint(start_s)
             end_repo, end_pr = _parse_endpoint(end_s)
             for repo in build_chain(start_repo, end_repo):
                 pr = start_pr if repo == start_repo else end_pr if repo == end_repo else None
-                add(repo, pr)
+                add(repo, pr, level)
         else:
-            add(*_parse_endpoint(part))
+            name, pr = _parse_endpoint(part)
+            add(name, pr, level)
     return entries
 
 
@@ -2016,7 +2061,7 @@ def _resolve_chain(
     graph: DepGraph,
     *,
     open_top: bool = False,
-) -> tuple[list[str], str | None, dict[str, int]]:
+) -> tuple[list[str], str | None, PrSpecs, LevelSpecs]:
     """Parse the chain spec, order it by ``CHAIN``, return planner inputs.
 
     Selection is literal — exactly what was named (ranges expanded), no
@@ -2030,12 +2075,15 @@ def _resolve_chain(
     that isn't being bumped, so the downstream release won't see the new
     upstream pin.  Such pairs produce a yellow warning but do not abort.
 
-    Returns ``(ordered_chain, stop_at, pr_specs)``.  With ``--open-top``,
-    the last package becomes ``DEPS_ONLY`` (deps update only, no release).
+    Returns ``(ordered_chain, stop_at, pr_specs, level_specs)``.  With
+    ``--open-top``, the last package becomes ``DEPS_ONLY`` (deps update
+    only, no release) — a ``%LEVEL`` on that package contradicts the
+    flag, so the combination is rejected.
     """
     entries = parse_chain_spec(spec)
-    pr_specs = {repo: pr for repo, pr in entries if pr is not None}
-    named = {repo for repo, _ in entries}
+    pr_specs = {e.repo: e.pr for e in entries if e.pr is not None}
+    level_specs = {e.repo: e.level for e in entries if e.level is not None}
+    named = {e.repo for e in entries}
     chain = [r for r in CHAIN if r in named]
 
     for downstream, upstream in _gap_pairs(chain, graph):
@@ -2044,7 +2092,13 @@ def _resolve_chain(
             f"unbumped intermediate — its new release won't see new {upstream}.[/]"
         )
 
-    return chain, (chain[-1] if open_top else None), pr_specs
+    stop_at = chain[-1] if open_top else None
+    if stop_at and stop_at in level_specs:
+        die(
+            f"{stop_at} is deps-only under --open-top — "
+            f"%{level_specs[stop_at]} would bump it anyway. Drop one or the other."
+        )
+    return chain, stop_at, pr_specs, level_specs
 
 
 _CLICK_CONTEXT = {"help_option_names": ["-h", "--help"]}
@@ -2082,12 +2136,13 @@ _chain_options = _stack(
     click.option(
         "--version-step",
         default="patch",
-        type=click.Choice(["major", "minor", "patch", "alpha"]),
+        type=click.Choice(list(VERSION_STEPS)),
         help=(
-            "Bump level. ``alpha`` cuts a PEP 440 pre-release tag "
-            "(``X.Y.ZaN``) for dev-cycle integration — gh-only, marked "
-            "as a GH prerelease.  Other levels applied to an alpha base "
-            "promote (drop the suffix)."
+            "Default bump level; a ``%LEVEL`` suffix in the chain spec "
+            "overrides it per package. ``alpha`` cuts a PEP 440 "
+            "pre-release tag (``X.Y.ZaN``) for dev-cycle integration — "
+            "gh-only, marked as a GH prerelease.  Other levels applied "
+            "to an alpha base promote (drop the suffix)."
         ),
     ),
     click.option("-n", "--name", "release_name", default="", help="Release name suffix"),
@@ -2119,20 +2174,26 @@ _chain_options = _stack(
 
 
 def _resolve_alpha_constraints(
-    version_step: str, target: str, prerelease: bool
+    levels: set[str], target: str, prerelease: bool
 ) -> tuple[str, bool]:
-    """Apply ``--version-step=alpha`` implications.
+    """Apply the ``alpha`` bump level's implications.
 
     Alpha tags are dev-cycle integration artefacts: always gh-only and
-    always GH prereleases.  Bumps are uniform chain-wide regardless of
-    step, so lower repos take the alpha bump too rather than promoting to
-    final mid-cycle.  Explicit pypi/testpypi targets are rejected up front.
+    always GH prereleases.  Those are plan-wide switches, so *levels* —
+    the effective bump level of every package releasing in this run —
+    must be all-alpha or alpha-free; a mix can't honour both halves.
+    Explicit pypi/testpypi targets are rejected up front.
     """
-    if version_step != "alpha":
+    if "alpha" not in levels:
         return target, prerelease
+    if levels != {"alpha"}:
+        die(
+            "alpha can't mix with final bump levels in one run — the gh-only "
+            "prerelease implications are plan-wide. Split the release, or make it all-alpha."
+        )
     if target in ("pypi", "testpypi"):
         die(
-            f"--version-step=alpha is incompatible with --target={target} — "
+            f"an alpha bump level is incompatible with --target={target} — "
             "alpha tags are gh-only by design. Drop the suffix to publish to PyPI."
         )
     return "gh-only", True
@@ -2189,9 +2250,11 @@ def quick(
     CHAIN_SPEC grammar:
       pkg                              one package (== pkg..pkg)
       pkg:NUM                          release pkg from PR #NUM
+      pkg%LEVEL                        bump pkg at LEVEL, not --version-step
       A..B                             range; intermediates filled from CHAIN
+      A..B%LEVEL                       range; LEVEL for every package in it
       A,B,C                            literal list — no cascade
-      A,B:NUM..C                       any combination
+      A,B:NUM%LEVEL..C                 any combination
 
     \b
     Selection is literal. For a full cascade through dependents, write the
@@ -2208,6 +2271,8 @@ def quick(
                                           PR chain; terok deps-only on its PR
       quick clearance,sandbox:221..terok  mixed; literal union
       quick sandbox..terok --prerelease   prerelease badge on each
+      quick sandbox%minor,executor%minor,terok
+                                          API-breaking lower pair, patch top
     """
     org, fork, cd, ctx = _common_ctx(org, fork, cache_dir, False, yes, skip_checks, check_timeout)
 
@@ -2219,7 +2284,7 @@ def quick(
     # on the right ref before dep-graph verification reads its
     # pyproject.toml — checking against ``upstream/master`` for a repo
     # whose PR introduces a new sibling dep would always false-positive.
-    pr_specs = {repo: pr for repo, pr in parse_chain_spec(chain_spec) if pr is not None}
+    pr_specs = {e.repo: e.pr for e in parse_chain_spec(chain_spec) if e.pr is not None}
     _require_open_prs(pr_specs, org)
 
     # Clone the WHOLE family up front so gap detection and dep validation
@@ -2230,10 +2295,13 @@ def quick(
         ensure_clone(repo, cd, org, fork, pr=pr_specs.get(repo))
     live_deps = _verify_dep_graph(CHAIN, cd)
 
-    chain, stop_at, _pr_specs = _resolve_chain(chain_spec, live_deps, open_top=open_top)
+    chain, stop_at, _pr_specs, level_specs = _resolve_chain(
+        chain_spec, live_deps, open_top=open_top
+    )
     assert _pr_specs == pr_specs  # invariant: both extractions agree
 
-    target, prerelease = _resolve_alpha_constraints(version_step, target, prerelease)
+    releasing_levels = {level_specs.get(r, version_step) for r in chain if r != stop_at}
+    target, prerelease = _resolve_alpha_constraints(releasing_levels, target, prerelease)
     pin_style = _resolve_pin_style(pin_style, target)
     plan = generate_plan(
         chain,
@@ -2246,6 +2314,7 @@ def quick(
         stop_at=stop_at,
         upgrade_pinned=upgrade_pinned,
         pr_specs=pr_specs,
+        level_specs=level_specs,
         prerelease=prerelease,
         target=target,
         pin_style=pin_style,
@@ -2428,7 +2497,7 @@ def plan_cmd(
     # Extract PR overrides up front so the clone-cache lands each repo
     # on the right ref before dep-graph verification reads its
     # pyproject.toml (see ``quick`` for the full rationale).
-    pr_specs = {repo: pr for repo, pr in parse_chain_spec(chain_spec) if pr is not None}
+    pr_specs = {e.repo: e.pr for e in parse_chain_spec(chain_spec) if e.pr is not None}
     _require_open_prs(pr_specs, org)
 
     # Clone the WHOLE family up front so gap detection and dep validation
@@ -2437,10 +2506,13 @@ def plan_cmd(
         ensure_clone(repo, cd, org, fork, pr=pr_specs.get(repo))
     live_deps = _verify_dep_graph(CHAIN, cd)
 
-    chain, stop_at, _pr_specs = _resolve_chain(chain_spec, live_deps, open_top=open_top)
+    chain, stop_at, _pr_specs, level_specs = _resolve_chain(
+        chain_spec, live_deps, open_top=open_top
+    )
     assert _pr_specs == pr_specs  # invariant: both extractions agree
 
-    target, prerelease = _resolve_alpha_constraints(version_step, target, prerelease)
+    releasing_levels = {level_specs.get(r, version_step) for r in chain if r != stop_at}
+    target, prerelease = _resolve_alpha_constraints(releasing_levels, target, prerelease)
     pin_style = _resolve_pin_style(pin_style, target)
     plan = generate_plan(
         chain,
@@ -2453,6 +2525,7 @@ def plan_cmd(
         stop_at=stop_at,
         upgrade_pinned=upgrade_pinned,
         pr_specs=pr_specs,
+        level_specs=level_specs,
         prerelease=prerelease,
         target=target,
         pin_style=pin_style,
