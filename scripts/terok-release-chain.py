@@ -151,6 +151,8 @@ WHEEL_HEAD_TIMEOUT = 10  # per HEAD probe of the actual download URL
 
 PYPI_POLL_INTERVAL = 5
 PYPI_HTTP_TIMEOUT = 10
+LOCK_INDEX_LAG_TIMEOUT = 600  # 10 min — one full max-age of PyPI's /simple/ page
+LOCK_INDEX_LAG_RETRY_INTERVAL = 5
 WORKFLOW_DISCOVERY_POLL_INTERVAL = 2
 WORKFLOW_DISCOVERY_TIMEOUT = 60  # seconds to wait for the release.yml run to register
 
@@ -1136,25 +1138,30 @@ def wait_for_release_run(gh_repo: str, run_id: str, ref: str, ctx: "Ctx") -> Non
         time.sleep(WORKFLOW_DISCOVERY_POLL_INTERVAL)
 
 
-def wait_for_pypi(repo: str, version: str, target: str, timeout: int) -> None:
-    """Block until *repo*-*version* resolves on the chosen index.
+def pypi_has(repo: str, version: str, target: str) -> bool:
+    """Whether *repo*-*version* is indexed on the chosen index right now.
 
-    Uses PyPI's JSON metadata endpoint — a 200 there means the version
-    is fully indexed and ``pip install`` would succeed. ``target`` is
-    one of ``"pypi"`` or ``"testpypi"``.
+    Asks PyPI's JSON metadata endpoint — the authoritative "this release
+    exists" signal (a 200 means the upload is fully registered).  ``target``
+    is one of ``"pypi"`` or ``"testpypi"``.
     """
     base = "https://test.pypi.org" if target == "testpypi" else "https://pypi.org"
     url = f"{base}/pypi/{repo}/{version}/json"
+    try:
+        req = urllib.request.Request(url)  # noqa: S310 — public PyPI endpoint
+        with urllib.request.urlopen(req, timeout=PYPI_HTTP_TIMEOUT) as resp:  # noqa: S310
+            return resp.status == 200  # noqa: PLR2004
+    except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError):
+        return False
+
+
+def wait_for_pypi(repo: str, version: str, target: str, timeout: int) -> None:
+    """Block until *repo*-*version* resolves on the chosen index."""
     console.print(f"Waiting for {repo} {version} on {target}...")
     for _elapsed in range(0, timeout, PYPI_POLL_INTERVAL):
-        try:
-            req = urllib.request.Request(url)  # noqa: S310 — public PyPI endpoint
-            with urllib.request.urlopen(req, timeout=PYPI_HTTP_TIMEOUT) as resp:  # noqa: S310
-                if resp.status == 200:  # noqa: PLR2004
-                    console.print(f"[green]Available on {target}![/]")
-                    return
-        except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError):
-            pass
+        if pypi_has(repo, version, target):
+            console.print(f"[green]Available on {target}![/]")
+            return
         time.sleep(PYPI_POLL_INTERVAL)
     die(f"Timed out waiting for {repo} {version} on {target}")
 
@@ -1499,6 +1506,80 @@ def _branch_matches_upstream(repo_dir: Path) -> bool:
     return head == tip
 
 
+# Poetry's version-solver phrasing for "the /simple/ index doesn't list any
+# version satisfying this constraint" — captures which dep it complained
+# about, so the lag triage can ask the JSON API whether that dep's
+# just-released version actually exists.
+_INDEX_LAG_RE = re.compile(
+    r"depends on ([A-Za-z0-9._-]+) \([^)]+\) which doesn't match any versions"
+)
+
+
+def _canonical(name: str) -> str:
+    """PEP 503 name normalisation — Poetry's solver output vs. our repo names."""
+    return name.lower().replace("_", "-")
+
+
+def _pypi_pinned_deps(package: str, plan: Plan) -> dict[str, str]:
+    """Sibling deps this plan pypi-pins for *package*, canonical name → version.
+
+    These are the versions *package*'s ``poetry lock`` must be able to
+    see on the index; a solver complaint about anything else is not
+    release-propagation lag.
+    """
+    return {
+        _canonical(s.params["dep_repo"]): s.params["dep_version"]
+        for s in plan.steps
+        if s.package == package
+        and s.kind == StepKind.DEP_UPDATE
+        and s.params.get("pin_style", plan.pin_style) == "pypi"
+    }
+
+
+def poetry_lock_riding_index_lag(
+    repo_dir: Path, pins: dict[str, str], target: str, timeout: int = LOCK_INDEX_LAG_TIMEOUT
+) -> None:
+    """Run ``poetry lock``, riding out PyPI simple-index propagation lag.
+
+    The publish gate (``wait_for_pypi``) polls PyPI's JSON API — the
+    authoritative "this release exists" signal.  Poetry, however,
+    resolves from the separately rendered ``/simple/`` index, whose CDN
+    copy can lag the JSON API by minutes right after an upload.  Worse,
+    Poetry caches whichever page it saw for its full ``max-age``
+    (10 min), so a bare retry re-fails instantly from the local cache
+    without ever touching the network.
+
+    Polling therefore has to be earned: the solver must have complained
+    about a dep this plan pinned (*pins*), and the JSON API must confirm
+    the pinned version exists — only then is there actually something to
+    wait for.  Each retry drops Poetry's repository cache first (the
+    name is exactly ``PyPI`` — lowercase silently clears nothing).  Any
+    other failure dies immediately, like a plain checked ``sh`` call.
+    """
+    for _elapsed in range(0, timeout, LOCK_INDEX_LAG_RETRY_INTERVAL):
+        r = sh("poetry", "lock", cwd=repo_dir, check=False)
+        if r.returncode == 0:
+            return
+        failure = f"Command failed (exit {r.returncode}): poetry lock\n{r.stderr.strip()}"
+        # Collapse whitespace first — the solver wraps long lines at terminal width.
+        complaint = _INDEX_LAG_RE.search(" ".join(r.stderr.split()))
+        if not complaint:
+            die(failure)
+        dep = _canonical(complaint.group(1))
+        version = pins.get(dep)
+        if version is None:
+            die(f"{failure}\n({dep} is not a dep this plan pinned — nothing to wait for)")
+        if not pypi_has(dep, version, target):
+            die(f"{failure}\n({dep} {version} is not on {target} at all — nothing to wait for)")
+        console.print(
+            f"[yellow]{dep} {version} is on {target}'s JSON API but not its /simple/ index "
+            f"yet — clearing Poetry's cache, retrying in {LOCK_INDEX_LAG_RETRY_INTERVAL}s...[/]"
+        )
+        sh("poetry", "cache", "clear", "PyPI", "--all", "-n", cwd=repo_dir, check=False)
+        time.sleep(LOCK_INDEX_LAG_RETRY_INTERVAL)
+    die(f"poetry lock still failing after {timeout}s of index-lag retries")
+
+
 def execute_step(step: Step, plan: Plan, ctx: Ctx):
     """Perform the side-effect prescribed by one plan step.
 
@@ -1553,7 +1634,9 @@ def execute_step(step: Step, plan: Plan, ctx: Ctx):
             prepend_changelog(changelog, p["version"], p.get("title", ""), notes.read_text())
 
         case StepKind.POETRY_LOCK:
-            sh("poetry", "lock", cwd=repo_dir)
+            poetry_lock_riding_index_lag(
+                repo_dir, _pypi_pinned_deps(step.package, plan), plan.target
+            )
 
         case StepKind.GIT_COMMIT:
             paths = ["pyproject.toml", "poetry.lock"]
