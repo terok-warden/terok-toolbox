@@ -287,7 +287,7 @@ class StepKind(StrEnum):
     VERSION_BUMP = "version_bump"
     DEP_UPDATE = "dep_update"
     CHANGELOG_UPDATE = "changelog_update"
-    POETRY_LOCK = "poetry_lock"
+    LOCK = "lock"
     GIT_COMMIT = "git_commit"
     GIT_PUSH = "git_push"
     PR_CREATE = "pr_create"
@@ -476,9 +476,11 @@ def sh(
 # PEP 508 strings (``name @ url``, ``name>=X,<Y``, ``name @ git+url@ref``).
 # The chain script finds entries by their leading project name and rewrites
 # the whole string in place — Poetry's old ``[tool.poetry.dependencies]``
-# inline-table form is no longer accepted.  ``[tool.poetry].version``
-# stays as the dynvers fallback (``[project].dynamic = ["version"]``);
-# ``set_version_toml`` keeps writing there.
+# inline-table form is no longer accepted.  The no-git-metadata version
+# fallback (``[project].dynamic = ["version"]``) lives per repo flavor:
+# ``[tool.poetry].version`` (poetry-dynamic-versioning) or
+# ``[tool.hatch.version].fallback-version`` (hatch-vcs on uv repos);
+# ``set_version_toml`` writes whichever the repo carries.
 
 
 _PEP508_NAME_RE = re.compile(r"^\s*([A-Za-z0-9][A-Za-z0-9._-]*)")
@@ -511,16 +513,30 @@ def _find_dep_index(deps: Any, dep_repo: str) -> int | None:
 
 
 def set_version_toml(path: Path, version: str):
-    """Set the version field in pyproject.toml.
+    """Set the no-git-metadata fallback version in pyproject.toml.
 
-    Lives at ``[tool.poetry].version`` even after the PEP 621 migration —
-    ``[project].dynamic = ["version"]`` tells Poetry the version is
-    dynamic, and ``poetry-dynamic-versioning`` reads it from here as the
-    fallback when no git tag is present.
+    The real release version always comes from the git tag; this field only
+    keeps tarball/no-git builds honest.  Poetry repos carry it at
+    ``[tool.poetry].version`` (read by poetry-dynamic-versioning); uv repos
+    at ``[tool.hatch.version].fallback-version`` (read by hatch-vcs).
     """
     doc = tomlkit.parse(path.read_text())
-    doc["tool"]["poetry"]["version"] = version
+    if "poetry" in doc.get("tool", {}):
+        doc["tool"]["poetry"]["version"] = version
+    else:
+        doc["tool"]["hatch"]["version"]["fallback-version"] = version
     path.write_text(tomlkit.dumps(doc))
+
+
+def lockfile_name(repo_dir: Path) -> str:
+    """The repo's committed lockfile — ``uv.lock`` marks a uv repo."""
+    return "uv.lock" if (repo_dir / "uv.lock").exists() else "poetry.lock"
+
+
+def lock_repo(repo_dir: Path):
+    """Regenerate the repo's lockfile with its own locker."""
+    locker = "uv" if lockfile_name(repo_dir) == "uv.lock" else "poetry"
+    sh(locker, "lock", cwd=repo_dir)
 
 
 def set_dep_url(path: Path, dep_repo: str, version: str, org: str):
@@ -1021,7 +1037,7 @@ def wait_for_wheel(repo: str, version: str, org: str, timeout: int = DEFAULT_WHE
 
     Two-phase check: the GitHub API lists the asset name first, then the
     actual download URL goes live a few seconds later as the CDN
-    propagates.  Only both together mean consumers can poetry-resolve it.
+    propagates.  Only both together mean consumers can resolve it.
     """
     expected = wheel_filename(repo, version)
     url = wheel_url(org, repo, version)
@@ -1234,7 +1250,7 @@ def plan_steps(
         # cycle-internal integration tags, not user-facing release events.
         if not prerelease:
             add(StepKind.CHANGELOG_UPDATE, version=pkg.new_version, title=name)
-    add(StepKind.POETRY_LOCK)
+    add(StepKind.LOCK)
     add(StepKind.GIT_COMMIT, message=commit_msg)
     add(StepKind.GIT_PUSH, branch=branch, fork=fork)
     if needs_new_pr:
@@ -1580,6 +1596,49 @@ def poetry_lock_riding_index_lag(
     die(f"poetry lock still failing after {timeout}s of index-lag retries")
 
 
+def uv_lock_riding_index_lag(
+    repo_dir: Path, pins: dict[str, str], target: str, timeout: int = LOCK_INDEX_LAG_TIMEOUT
+) -> None:
+    """``uv lock`` twin of `poetry_lock_riding_index_lag`.
+
+    uv resolves from the same CDN-rendered ``/simple/`` index, so a
+    freshly published pin can lag for it identically.  Two differences:
+    uv's resolver prose varies too much for one complaint regex, so the
+    polling is earned by a slightly weaker gate — the failure must at
+    least mention a dep this plan pinned, and the JSON API must confirm
+    every mentioned pin exists; and there is no cache-clear dance —
+    retries pass ``--refresh``, which bypasses uv's cached index pages
+    wholesale.
+    """
+    for _elapsed in range(0, timeout, LOCK_INDEX_LAG_RETRY_INTERVAL):
+        refresh = ["--refresh"] if _elapsed else []
+        r = sh("uv", "lock", *refresh, cwd=repo_dir, check=False)
+        if r.returncode == 0:
+            return
+        failure = f"Command failed (exit {r.returncode}): uv lock\n{r.stderr.strip()}"
+        stderr_flat = _canonical(" ".join(r.stderr.split()))
+        mentioned = {dep: ver for dep, ver in pins.items() if dep in stderr_flat}
+        if not mentioned:
+            die(failure)
+        for dep, version in mentioned.items():
+            if not pypi_has(dep, version, target):
+                die(f"{failure}\n({dep} {version} is not on {target} at all — nothing to wait for)")
+        console.print(
+            f"[yellow]{', '.join(mentioned)} on {target}'s JSON API but uv cannot resolve yet "
+            f"— retrying with --refresh in {LOCK_INDEX_LAG_RETRY_INTERVAL}s...[/]"
+        )
+        time.sleep(LOCK_INDEX_LAG_RETRY_INTERVAL)
+    die(f"uv lock still failing after {timeout}s of index-lag retries")
+
+
+def lock_riding_index_lag(repo_dir: Path, pins: dict[str, str], target: str) -> None:
+    """Regenerate the repo's lockfile with its own locker, riding index lag."""
+    if lockfile_name(repo_dir) == "uv.lock":
+        uv_lock_riding_index_lag(repo_dir, pins, target)
+    else:
+        poetry_lock_riding_index_lag(repo_dir, pins, target)
+
+
 def execute_step(step: Step, plan: Plan, ctx: Ctx):
     """Perform the side-effect prescribed by one plan step.
 
@@ -1633,13 +1692,11 @@ def execute_step(step: Step, plan: Plan, ctx: Ctx):
                 return
             prepend_changelog(changelog, p["version"], p.get("title", ""), notes.read_text())
 
-        case StepKind.POETRY_LOCK:
-            poetry_lock_riding_index_lag(
-                repo_dir, _pypi_pinned_deps(step.package, plan), plan.target
-            )
+        case StepKind.LOCK:
+            lock_riding_index_lag(repo_dir, _pypi_pinned_deps(step.package, plan), plan.target)
 
         case StepKind.GIT_COMMIT:
-            paths = ["pyproject.toml", "poetry.lock"]
+            paths = ["pyproject.toml", lockfile_name(repo_dir)]
             if (repo_dir / "CHANGELOG.md").exists():
                 paths.append("CHANGELOG.md")
             sh("git", "add", *paths, cwd=repo_dir)
@@ -2454,9 +2511,9 @@ def quick(
 def open_chain(branch, repos, pretend, org, fork, cache_dir):
     """Open a PR chain for cross-cutting development.
 
-    Creates a branch in each repo, wires sibling deps as Poetry git-branch
-    references, and opens PRs.  During an open chain, use `poetry install`
-    for development — not pipx.
+    Creates a branch in each repo, wires sibling deps as git-branch
+    references (PEP 508), and opens PRs.  During an open chain, develop
+    with the repo's own locker — `poetry install` or `uv sync` — not pipx.
 
     \b
     Examples:
@@ -2492,8 +2549,8 @@ def open_chain(branch, repos, pretend, org, fork, cache_dir):
                     if not ctx.dry_run:
                         set_branch_dep(repo_dir / "pyproject.toml", dep, branch, fork)
             if not ctx.dry_run:
-                sh("poetry", "lock", cwd=repo_dir)
-                sh("git", "add", "pyproject.toml", "poetry.lock", cwd=repo_dir)
+                lock_repo(repo_dir)
+                sh("git", "add", "pyproject.toml", lockfile_name(repo_dir), cwd=repo_dir)
                 sh("git", "commit", "-m", f"chore: wire {branch} branch deps", cwd=repo_dir)
 
         console.print("  pushing to fork")

@@ -108,7 +108,7 @@ operator directly from their own Fedora toolbox, no warden detour.
 One-time, inside the toolbox:
 
 ```bash
-toolbox run sudo dnf install gh poetry \
+toolbox run sudo dnf install gh poetry uv \
     python3-click python3-tomlkit python3-pydantic python3-rich
 ```
 

@@ -21,7 +21,7 @@ CONTAINER=warden
 ROOT="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
 HOME_DIR="${WARDEN_HOME:-$HOME/warden/home}"
 IMAGE="${WARDEN_IMAGE:-registry.fedoraproject.org/fedora-toolbox:44}"
-PACKAGES="gh poetry python3-click python3-tomlkit python3-pydantic python3-rich"
+PACKAGES="gh poetry uv python3-click python3-tomlkit python3-pydantic python3-rich"
 
 if [ "${WARDEN_REBUILD:-0}" = "1" ]; then
     distrobox rm -f "$CONTAINER" 2>/dev/null || true
