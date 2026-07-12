@@ -96,7 +96,11 @@ release-prep commit — single source of truth for the GH Release body
 and the in-repo changelog.  Pre-release cuts (`alpha`/`beta`/`rc`,
 each optionally sized `-patch`/`-minor`/`-major`; shortcuts `a`,
 `amin`, `amaj`, `b`, `bmin`, `bmaj`, `rcmin`, `rcmaj`, plus `maj`/`min`
-for the final levels) seed notes but leave the changelog untouched.
+and `rel` for the final levels) seed notes but leave the changelog
+untouched.  `release` promotes a pre-release in place (suffix off,
+base untouched).  The default `--version-step` is `auto`: pypi/
+testpypi runs promote (`release`), gh-only runs continue each
+package's running stage or open a fresh alpha from a final version.
 
 ## Operator-mode runs (gh-only, no warden box)
 

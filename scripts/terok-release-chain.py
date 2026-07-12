@@ -32,10 +32,15 @@ Publish targets (``--target``):
     gh-only          GitHub Release only, no PyPI/TestPyPI
 
 Version steps:
-    ``--version-step`` (default ``patch``) sets the bump level for every
+    ``--version-step`` (default ``auto``) sets the bump level for every
     released package; a ``%LEVEL`` suffix in the chain spec overrides it
-    per package.  The level reflects each package's own API delta, which
-    the chain can't infer — spell it out wherever it differs from the
+    per package.  ``auto`` follows the target: pypi/testpypi runs
+    promote each package's pre-release in place (``release``; a package
+    already on a final version must be spelled out — that's an API-delta
+    call the chain can't make), gh-only runs continue each package's
+    running stage, or open a fresh alpha series from a final version.
+    Explicit levels reflect each package's own API delta, which the
+    chain can't infer — spell them out wherever they differ from the
     run's default.  A suffix on a range applies to every package the
     range expands to; for per-package granularity inside a range, write
     the literal list instead.
@@ -57,8 +62,10 @@ Dev-cycle integration tags (pre-release bump levels):
     final.  Pre-release is all-or-nothing: those plan-wide implications
     can't hold for half a run, so mixing pre-release and final levels
     via ``%LEVEL`` overrides is rejected (stages and sizes may vary).
-    Promote to a real release at the end of the cycle with a final
-    level — the suffix is dropped and PyPI publish resumes.
+    Promote to a real release at the end of the cycle with ``release``
+    (shortcut ``rel``, or just the ``auto`` default on a pypi run) — the
+    suffix is dropped in place and PyPI publish resumes; ``minor``/
+    ``major`` promote too, bumping the dropped base another step.
 
 Usage:
     terok-release quick sandbox
@@ -203,8 +210,11 @@ _VER_RE = re.compile(r"^(\d+)\.(\d+)\.(\d+)(?:(a|b|rc)(\d+))?$")
 #: Pre-release stages in promotion order, with their PEP 440 letters.
 STAGE_LETTERS = {"alpha": "a", "beta": "b", "rc": "rc"}
 
+#: Base-bump sizes a pre-release stage can take.
+SIZES = ("patch", "minor", "major")
+
 #: Bump levels that cut a real (PyPI-publishable) release.
-FINAL_STEPS = ("major", "minor", "patch")
+FINAL_STEPS = ("major", "minor", "patch", "release")
 
 # The bump levels ``--version-step`` accepts — and, prefixed with ``%``,
 # the per-package overrides the chain spec accepts.  A bare stage name
@@ -212,12 +222,13 @@ FINAL_STEPS = ("major", "minor", "patch")
 VERSION_STEPS = (
     *FINAL_STEPS,
     *STAGE_LETTERS,
-    *(f"{stage}-{size}" for stage in STAGE_LETTERS for size in FINAL_STEPS),
+    *(f"{stage}-{size}" for stage in STAGE_LETTERS for size in SIZES),
 )
 
 STEP_SHORTCUTS = {
     "maj": "major",
     "min": "minor",
+    "rel": "release",
     "a": "alpha",
     "amin": "alpha-minor",
     "amaj": "alpha-major",
@@ -253,14 +264,20 @@ def bump_version(ver: str, level: str = "patch") -> str:
     (``0.8.6a3`` + ``beta`` → ``0.8.6b1``).  Stepping back down a stage
     on the same base is rejected.
 
-    Final levels applied to a pre-release *promote* — the suffix is
-    dropped, then the base version is bumped (except ``patch``, which
-    promotes in place: ``X.Y.ZaN`` → ``X.Y.Z``).
+    ``release`` promotes explicitly: it only strips the suffix
+    (``X.Y.ZaN`` → ``X.Y.Z``) and refuses a version that is already
+    final.  The other final levels applied to a pre-release *promote*
+    too — the suffix is dropped, then the base version is bumped
+    (except ``patch``, which promotes in place like ``release``).
     """
     m = _VER_RE.match(ver) or die(f"unparseable version: {ver}")
     major, minor, patch = int(m[1]), int(m[2]), int(m[3])
     cur_letter = m[4]
     match canonical_step(level):
+        case "release":
+            if not cur_letter:
+                die(f"{ver} is already a final release — nothing for 'release' to promote")
+            return f"{major}.{minor}.{patch}"
         case "major":
             return f"{major + 1}.0.0"
         case "minor":
@@ -308,6 +325,30 @@ def _bump_prerelease(ver: str, stage: str, size: str) -> str:
     if letter == cur_letter:
         return f"{major}.{minor}.{patch}{letter}{cur_n + 1}"
     return f"{major}.{minor}.{patch}{letter}1"
+
+
+#: Stage name per PEP 440 letter — STAGE_LETTERS inverted.
+_LETTER_STAGES = {letter: stage for stage, letter in STAGE_LETTERS.items()}
+
+
+def auto_step(current: str, target: str) -> str:
+    """Resolve the ``auto`` bump level for one package.
+
+    Publishing targets promote: ``release`` strips the pre-release
+    suffix (and refuses a package that has none — an API-delta call the
+    chain can't make; spell that one out with ``%LEVEL``).  gh-only
+    runs stay inside the dev cycle: continue whatever stage the package
+    is on, or open a fresh alpha series from a final version.
+    """
+    m = _VER_RE.match(current) or die(f"unparseable version: {current}")
+    if target in ("pypi", "testpypi"):
+        if not m[4]:
+            die(
+                f"auto bump level: {current} is already final — 'release' has nothing "
+                f"to promote. Pass --version-step or a %LEVEL override for this package."
+            )
+        return "release"
+    return _LETTER_STAGES[m[4]] if m[4] else "alpha"
 
 
 def build_chain(start: str, end: str | None = None) -> list[str]:
@@ -1504,6 +1545,8 @@ def generate_plan(
 
         # Chain-wide default, overridden where the spec says ``%LEVEL``.
         level = (level_specs or {}).get(repo, version_step)
+        if level == "auto":
+            level = auto_step(current, target)
         new_ver = bump_version(current, level) if action != Action.DEPS_ONLY else None
 
         repo_deps = live_deps[repo]
@@ -2295,17 +2338,23 @@ _chain_options = _stack(
     click.argument("chain_spec"),
     click.option(
         "--version-step",
-        default="patch",
-        type=click.Choice(list(ACCEPTED_STEPS)),
+        default="auto",
+        type=click.Choice(["auto", *ACCEPTED_STEPS]),
         help=(
             "Default bump level; a ``%LEVEL`` suffix in the chain spec "
-            "overrides it per package. ``alpha``/``beta``/``rc`` cut "
-            "PEP 440 pre-release tags (``X.Y.ZaN``/``bN``/``rcN``) for "
-            "dev-cycle integration — gh-only, marked as GH prereleases; "
-            "an optional ``-patch``/``-minor``/``-major`` suffix picks "
-            "the base bump (bare stage = ``-patch``). Final levels "
-            "applied to a pre-release base promote (drop the suffix). "
-            "Shortcuts: maj min a amin amaj b bmin bmaj rcmin rcmaj."
+            "overrides it per package. ``auto`` (the default) follows "
+            "the target: pypi/testpypi promote each package's "
+            "pre-release in place (``release``; a package already final "
+            "must be spelled out), gh-only continues each package's "
+            "running stage or opens a fresh alpha from a final. "
+            "``alpha``/``beta``/``rc`` cut PEP 440 pre-release tags "
+            "(``X.Y.ZaN``/``bN``/``rcN``) for dev-cycle integration — "
+            "gh-only, marked as GH prereleases; an optional "
+            "``-patch``/``-minor``/``-major`` suffix picks the base "
+            "bump (bare stage = ``-patch``). ``release`` strips a "
+            "pre-release suffix in place; other final levels applied "
+            "to a pre-release base promote (drop the suffix). "
+            "Shortcuts: maj min rel a amin amaj b bmin bmaj rcmin rcmaj."
         ),
     ),
     click.option("-n", "--name", "release_name", default="", help="Release name suffix"),
@@ -2465,8 +2514,18 @@ def quick(
     )
     assert _pr_specs == pr_specs  # invariant: both extractions agree
 
+    # ``auto`` classifies by target alone (promote on publishing targets,
+    # stay pre-release on gh-only) — exact per-package levels resolve
+    # against current versions later, but the plan-wide implications are
+    # already decided here.
     releasing_levels = {
-        canonical_step(level_specs.get(r, version_step)) for r in chain if r != stop_at
+        canonical_step(
+            ("release" if target in ("pypi", "testpypi") else "alpha")
+            if (lv := level_specs.get(r, version_step)) == "auto"
+            else lv
+        )
+        for r in chain
+        if r != stop_at
     }
     target, prerelease = _resolve_prerelease_constraints(releasing_levels, target, prerelease)
     pin_style = _resolve_pin_style(pin_style, target)
@@ -2678,8 +2737,18 @@ def plan_cmd(
     )
     assert _pr_specs == pr_specs  # invariant: both extractions agree
 
+    # ``auto`` classifies by target alone (promote on publishing targets,
+    # stay pre-release on gh-only) — exact per-package levels resolve
+    # against current versions later, but the plan-wide implications are
+    # already decided here.
     releasing_levels = {
-        canonical_step(level_specs.get(r, version_step)) for r in chain if r != stop_at
+        canonical_step(
+            ("release" if target in ("pypi", "testpypi") else "alpha")
+            if (lv := level_specs.get(r, version_step)) == "auto"
+            else lv
+        )
+        for r in chain
+        if r != stop_at
     }
     target, prerelease = _resolve_prerelease_constraints(releasing_levels, target, prerelease)
     pin_style = _resolve_pin_style(pin_style, target)
