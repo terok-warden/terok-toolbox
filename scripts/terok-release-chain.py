@@ -176,6 +176,8 @@ WORKFLOW_DISCOVERY_TIMEOUT = 60  # seconds to wait for the release.yml run to re
 
 MERGE_RACE_POLL_COUNT = 15
 MERGE_RACE_POLL_INTERVAL = 2
+MANUAL_MERGE_TIMEOUT = 1800  # operator merges in the browser; same patience as CI checks
+MANUAL_MERGE_POLL_INTERVAL = 10
 
 RELEASE_BRANCH_PREFIX = "chore/release-"
 BUMP_DEPS_BRANCH_PREFIX = "chore/bump-deps"
@@ -1130,12 +1132,42 @@ def squash_merge(pr_url: str, gh_repo: str) -> str:
                 die(
                     f"PR still not merged after {MERGE_RACE_POLL_COUNT * MERGE_RACE_POLL_INTERVAL}s"
                 )
+        elif "refusing to allow" in err and "workflow" in err:
+            return _await_manual_merge(pr_url, gh_repo)
         else:
             die(f"Merge failed: {err.strip()}")
 
     sha = _gh_merge_commit(pr_url, gh_repo)
     console.print(f"[green]Merged ({sha[:12]})[/]")
     return sha
+
+
+def _await_manual_merge(pr_url: str, gh_repo: str) -> str:
+    """Park the run while the operator merges a workflow-touching PR.
+
+    GitHub refuses API merges of PRs that change ``.github/workflows``
+    unless the token carries the ``workflow`` scope — a per-token
+    property this run cannot fix.  Recoverable exactly like a failing
+    check: alert the operator, hand them the PR, and poll until it is
+    merged in the browser (or with a stronger token).
+    """
+    console.bell()
+    console.print("\n[black on bright_yellow] INPUT NEEDED [/]")
+    console.print(
+        "[yellow]The token can't merge a PR that changes workflow files "
+        f"(no `workflow` scope). Merge it manually; the run continues once it lands:[/]\n"
+        f"  {pr_url}"
+    )
+    for _elapsed in range(0, MANUAL_MERGE_TIMEOUT, MANUAL_MERGE_POLL_INTERVAL):
+        match pr_state(pr_url, gh_repo):
+            case "MERGED":
+                sha = _gh_merge_commit(pr_url, gh_repo)
+                console.print(f"[green]Merged manually ({sha[:12]})[/]")
+                return sha
+            case "CLOSED":
+                die("PR closed without merging.")
+        time.sleep(MANUAL_MERGE_POLL_INTERVAL)
+    die(f"PR still not merged after {MANUAL_MERGE_TIMEOUT}s — resume the plan once it is.")
 
 
 def _wheel_downloadable(url: str) -> bool:
