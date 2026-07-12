@@ -90,25 +90,27 @@ meaningful entries.  `:wq` without edits ships the seeded notes as-is.
 - **Re-running `plan`** keeps existing notes (operator edits survive
   crash-resume); delete the file to force a fresh draft.
 
-**Final releases** (no `--version-step=alpha`) also prepend
+**Final releases** (no pre-release `--version-step`) also prepend
 `## vX.Y.Z — Title` to each package's `CHANGELOG.md` in the
 release-prep commit — single source of truth for the GH Release body
-and the in-repo changelog.  Alpha cuts seed notes but leave the
-changelog untouched.
+and the in-repo changelog.  Pre-release cuts (`alpha`/`beta`/`rc`,
+each optionally sized `-patch`/`-minor`/`-major`; shortcuts `a`,
+`amin`, `amaj`, `b`, `bmin`, `bmaj`, `rcmin`, `rcmaj`, plus `maj`/`min`
+for the final levels) seed notes but leave the changelog untouched.
 
 ## Operator-mode runs (gh-only, no warden box)
 
 PyPI/TestPyPI publishes go through warden because the `pypi` environment
 gates on `triggering_actor == terok-warden`. **`--target=gh-only` runs do
 not** — the `github-release` job has no actor check (tag-creation is
-gated by the org's `v*.*.*` ruleset instead). So `--version-step=alpha`
-dev-cycle cuts and any other gh-only release can be driven by the
+gated by the org's `v*.*.*` ruleset instead). So pre-release
+(`alpha`/`beta`/`rc`) dev-cycle cuts and any other gh-only release can be driven by the
 operator directly from their own Fedora toolbox, no warden detour.
 
 One-time, inside the toolbox:
 
 ```bash
-toolbox run sudo dnf install gh poetry uv \
+toolbox run sudo dnf install gh uv \
     python3-click python3-tomlkit python3-pydantic python3-rich
 ```
 
