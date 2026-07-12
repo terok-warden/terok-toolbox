@@ -1165,7 +1165,7 @@ def _find_release_run(gh_repo: str, ref: str, event: str) -> str:
     die(f"No release.yml run found for {gh_repo} ref {ref} (event={event})")
 
 
-def wait_for_release_run(gh_repo: str, run_id: str, ref: str, ctx: "Ctx") -> None:
+def wait_for_release_run(gh_repo: str, run_id: str, ref: str, ctx: Ctx) -> None:
     """Watch a ``release.yml`` run, alerting when it pauses for approval.
 
     GitHub's deployment-protection rules (required reviewers on the
