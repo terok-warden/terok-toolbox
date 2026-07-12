@@ -679,10 +679,11 @@ def set_dep_pypi(path: Path, dep_repo: str, version: str):
     if idx is None:
         return
     name = _pep508_name(str(deps[idx])) or dep_repo
-    parts = [int(p) for p in version.split(".")]
-    major = parts[0]
-    minor = parts[1] if len(parts) > 1 else 0
-    patch = parts[2] if len(parts) > 2 else 0
+    # The floor keeps the full version (a pre-release floor is valid PEP
+    # 440 and admits its own pre-releases); the cap derives from the
+    # numeric triple alone.
+    m = _VER_RE.match(version) or die(f"unparseable version for {dep_repo}: {version}")
+    major, minor, patch = int(m[1]), int(m[2]), int(m[3])
     if major > 0:
         upper = f"{major + 1}.0.0"
     elif minor > 0:
