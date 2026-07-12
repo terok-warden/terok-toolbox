@@ -2021,6 +2021,16 @@ def execute_plan(plan: Plan, *, mode: ExecMode, ctx: Ctx) -> Plan:
         try:
             execute_step(step, plan, ctx)
             step.status = "completed"
+        except (KeyboardInterrupt, click.exceptions.Abort):
+            # Ctrl-C at a park/prompt is a deliberate "not now", not a
+            # crash — leave the operator holding the resume command.
+            step.status = "failed"
+            step.result["error"] = "interrupted (Ctrl-C)"
+            if ctx.plan_path:
+                save_plan(plan, ctx.plan_path)
+                console.print(f"\n[yellow]Interrupted — plan state saved:[/] {ctx.plan_path}")
+                console.print(f"[yellow]Resume with: terok-release execute {ctx.plan_path}[/]")
+            raise
         except (subprocess.CalledProcessError, SystemExit) as exc:
             step.status = "failed"
             step.result["error"] = str(exc)
