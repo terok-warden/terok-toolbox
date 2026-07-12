@@ -1725,6 +1725,13 @@ def execute_step(step: Step, plan: Plan, ctx: Ctx):
 
         case StepKind.VERSION_BUMP:
             set_version_toml(repo_dir / "pyproject.toml", p["version"])
+            # A repo may lock-step other files to its version (mkdocs-terok's
+            # README install snippet); such repos ship the sync as
+            # scripts/check-readme-version.py --write, which no-ops on
+            # pre-releases so the README keeps advertising the last final.
+            readme_sync = repo_dir / "scripts" / "check-readme-version.py"
+            if readme_sync.exists():
+                sh("python3", str(readme_sync), "--write", cwd=repo_dir)
 
         case StepKind.DEP_UPDATE:
             # Plans generated before the pin-style flag landed don't carry
@@ -1761,6 +1768,8 @@ def execute_step(step: Step, plan: Plan, ctx: Ctx):
             paths = ["pyproject.toml", "uv.lock"]
             if (repo_dir / "CHANGELOG.md").exists():
                 paths.append("CHANGELOG.md")
+            if (repo_dir / "scripts" / "check-readme-version.py").exists():
+                paths.append("README.md")
             sh("git", "add", *paths, cwd=repo_dir)
             # Idempotent: HEAD already carries this commit message (re-run of a
             # previously-committed step), or nothing is staged (a prior feature
