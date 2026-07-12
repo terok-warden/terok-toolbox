@@ -32,24 +32,40 @@ Publish targets (``--target``):
     gh-only          GitHub Release only, no PyPI/TestPyPI
 
 Version steps:
-    ``--version-step`` (default ``patch``) sets the bump level for every
+    ``--version-step`` (default ``auto``) sets the bump level for every
     released package; a ``%LEVEL`` suffix in the chain spec overrides it
-    per package.  The level reflects each package's own API delta, which
-    the chain can't infer — spell it out wherever it differs from the
+    per package.  ``auto`` follows the target: pypi/testpypi runs
+    promote each package's pre-release in place (``release``; a package
+    already on a final version must be spelled out — that's an API-delta
+    call the chain can't make), gh-only runs continue each package's
+    running stage, or open a fresh alpha series from a final version.
+    Explicit levels reflect each package's own API delta, which the
+    chain can't infer — spell them out wherever they differ from the
     run's default.  A suffix on a range applies to every package the
     range expands to; for per-package granularity inside a range, write
     the literal list instead.
 
-Dev-cycle integration tags (``--version-step=alpha``):
-    Cuts ``vX.Y.ZaN`` pre-release tags between real PyPI releases so a
-    cross-repo PR chain can pin to tagged wheels on master instead of
-    git-branch refs.  Always implies ``--target=gh-only`` and the GH
-    prerelease flag; every repo goes ``X.Y.Z`` → ``X.Y.(Z+1)a1`` rather
-    than silently promoting to final.  Alpha is all-or-nothing: those
-    plan-wide implications can't hold for half a run, so mixing ``alpha``
-    with final levels via ``%LEVEL`` overrides is rejected.  Promote
-    to a real release at the end of the cycle with a plain ``--version-
-    step=patch`` — the alpha suffix is dropped and PyPI publish resumes.
+Dev-cycle integration tags (pre-release bump levels):
+    ``alpha``, ``beta`` and ``rc`` cut ``vX.Y.ZaN``/``bN``/``rcN``
+    pre-release tags between real PyPI releases so a cross-repo PR chain
+    can pin to tagged wheels on master instead of git-branch refs.  Each
+    stage takes an optional base size — ``alpha-patch`` (what bare
+    ``alpha`` means), ``alpha-minor``, ``alpha-major``, likewise for
+    ``beta-*`` and ``rc-*`` — choosing how far the series jumps past the
+    last release; a later stage on the same base restarts the counter
+    (``0.8.6a3`` + ``beta`` → ``0.8.6b1``), and stepping back down a
+    stage on the same base is rejected.  Shortcuts: ``maj``/``min`` for
+    the final levels, ``a``/``amin``/``amaj``, ``b``/``bmin``/``bmaj``,
+    ``rcmin``/``rcmaj``.  Pre-release levels always imply
+    ``--target=gh-only`` and the GH prerelease flag; every repo goes
+    ``X.Y.Z`` → ``X.Y.(Z+1)a1``-style rather than silently promoting to
+    final.  Pre-release is all-or-nothing: those plan-wide implications
+    can't hold for half a run, so mixing pre-release and final levels
+    via ``%LEVEL`` overrides is rejected (stages and sizes may vary).
+    Promote to a real release at the end of the cycle with ``release``
+    (shortcut ``rel``, or just the ``auto`` default on a pypi run) — the
+    suffix is dropped in place and PyPI publish resumes; ``minor``/
+    ``major`` promote too, bumping the dropped base another step.
 
 Usage:
     terok-release quick sandbox
@@ -59,6 +75,8 @@ Usage:
     terok-release quick util..shield%minor,executor:412%patch,terok%patch
     terok-release quick mkdocs --target=testpypi
     terok-release quick sandbox..terok --version-step=alpha
+    terok-release quick sandbox..terok --version-step=bmin
+    terok-release quick util..terok --version-step=rc
     terok-release open feat/comms clearance
     terok-release plan sandbox..terok -o plan.json
     terok-release show plan.json
@@ -158,6 +176,8 @@ WORKFLOW_DISCOVERY_TIMEOUT = 60  # seconds to wait for the release.yml run to re
 
 MERGE_RACE_POLL_COUNT = 15
 MERGE_RACE_POLL_INTERVAL = 2
+MANUAL_MERGE_TIMEOUT = 1800  # operator merges in the browser; same patience as CI checks
+MANUAL_MERGE_POLL_INTERVAL = 10
 
 RELEASE_BRANCH_PREFIX = "chore/release-"
 BUMP_DEPS_BRANCH_PREFIX = "chore/bump-deps"
@@ -187,41 +207,150 @@ def slugify(text: str) -> str:
     return re.sub(r"-+", "-", re.sub(r"[^a-z0-9]+", "-", text.lower())).strip("-")
 
 
-_VER_RE = re.compile(r"^(\d+)\.(\d+)\.(\d+)(?:a(\d+))?$")
+_VER_RE = re.compile(r"^(\d+)\.(\d+)\.(\d+)(?:(a|b|rc)(\d+))?$")
+
+#: Pre-release stages in promotion order, with their PEP 440 letters.
+STAGE_LETTERS = {"alpha": "a", "beta": "b", "rc": "rc"}
+
+#: Base-bump sizes a pre-release stage can take.
+SIZES = ("patch", "minor", "major")
+
+#: Bump levels that cut a real (PyPI-publishable) release.
+FINAL_STEPS = ("major", "minor", "patch", "release")
 
 # The bump levels ``--version-step`` accepts — and, prefixed with ``%``,
-# the per-package overrides the chain spec accepts.
-VERSION_STEPS = ("major", "minor", "patch", "alpha")
+# the per-package overrides the chain spec accepts.  A bare stage name
+# means its ``-patch`` variant; STEP_SHORTCUTS adds the terse spellings.
+VERSION_STEPS = (
+    *FINAL_STEPS,
+    *STAGE_LETTERS,
+    *(f"{stage}-{size}" for stage in STAGE_LETTERS for size in SIZES),
+)
+
+STEP_SHORTCUTS = {
+    "maj": "major",
+    "min": "minor",
+    "rel": "release",
+    "a": "alpha",
+    "amin": "alpha-minor",
+    "amaj": "alpha-major",
+    "b": "beta",
+    "bmin": "beta-minor",
+    "bmaj": "beta-major",
+    "rcmin": "rc-minor",
+    "rcmaj": "rc-major",
+}
+
+#: Every accepted ``--version-step`` / ``%LEVEL`` spelling.
+ACCEPTED_STEPS = (*VERSION_STEPS, *STEP_SHORTCUTS)
+
+
+def canonical_step(level: str) -> str:
+    """Resolve shortcuts and bare stage names to a canonical bump level.
+
+    ``a`` → ``alpha`` → ``alpha-patch``; final levels pass through.
+    """
+    level = STEP_SHORTCUTS.get(level, level)
+    return f"{level}-patch" if level in STAGE_LETTERS else level
 
 
 def bump_version(ver: str, level: str = "patch") -> str:
-    """``X.Y.Z`` or ``X.Y.ZaN`` → next version at the given level.
+    """``X.Y.Z`` or ``X.Y.Z{a|b|rc}N`` → next version at the given level.
 
-    ``alpha`` cuts or continues a dev-cycle integration tag (no PyPI).
-    Other levels applied to an alpha version *promote* — the suffix is
-    dropped, then the base version is bumped (except ``patch``, which
-    promotes in place: ``X.Y.ZaN`` → ``X.Y.Z``).
+    Pre-release levels — ``alpha``/``beta``/``rc``, each with a
+    ``-patch``/``-minor``/``-major`` base size (bare stage = ``-patch``)
+    — cut or continue a dev-cycle integration tag (no PyPI): on a final
+    version they open a new series one base-bump ahead; on a running
+    series whose base already carries the requested size they increment
+    it; a later stage on the same base restarts the counter
+    (``0.8.6a3`` + ``beta`` → ``0.8.6b1``).  Stepping back down a stage
+    on the same base is rejected.
+
+    ``release`` promotes explicitly: it only strips the suffix
+    (``X.Y.ZaN`` → ``X.Y.Z``) and refuses a version that is already
+    final.  The other final levels applied to a pre-release *promote*
+    too — the suffix is dropped, then the base version is bumped
+    (except ``patch``, which promotes in place like ``release``).
     """
     m = _VER_RE.match(ver) or die(f"unparseable version: {ver}")
     major, minor, patch = int(m[1]), int(m[2]), int(m[3])
-    alpha_n = int(m[4]) if m[4] else None
-    match level:
+    cur_letter = m[4]
+    match canonical_step(level):
+        case "release":
+            if not cur_letter:
+                die(f"{ver} is already a final release — nothing for 'release' to promote")
+            return f"{major}.{minor}.{patch}"
         case "major":
             return f"{major + 1}.0.0"
         case "minor":
             return f"{major}.{minor + 1}.0"
-        case "alpha":
+        case "patch":
             return (
-                f"{major}.{minor}.{patch}a{alpha_n + 1}"
-                if alpha_n is not None
-                else f"{major}.{minor}.{patch + 1}a1"
-            )
-        case _:  # patch (default)
-            return (
-                f"{major}.{minor}.{patch}"  # promote alpha → final
-                if alpha_n is not None
+                f"{major}.{minor}.{patch}"  # promote pre-release → final
+                if cur_letter
                 else f"{major}.{minor}.{patch + 1}"
             )
+        case step:
+            stage, _, size = step.partition("-")
+            return _bump_prerelease(ver, stage, size)
+
+
+def _bump_prerelease(ver: str, stage: str, size: str) -> str:
+    """Cut, continue, or stage-promote a pre-release series.
+
+    The numeric triple of a running series is already the future release
+    (``0.8.6a2`` targets ``0.8.6``), so the requested *size* is measured
+    against that: a base that already carries the bump stays (the series
+    continues, or a later *stage* restarts its counter on it); anything
+    else opens a fresh series one *size*-bump ahead.
+    """
+    m = _VER_RE.match(ver)
+    major, minor, patch = int(m[1]), int(m[2]), int(m[3])
+    cur_letter, cur_n = m[4], int(m[5]) if m[5] else 0
+    letter = STAGE_LETTERS[stage]
+
+    in_series = cur_letter is not None
+    base = {
+        "patch": (major, minor, patch) if in_series else (major, minor, patch + 1),
+        "minor": (major, minor, 0) if in_series and patch == 0 else (major, minor + 1, 0),
+        "major": (major, 0, 0) if in_series and minor == patch == 0 else (major + 1, 0, 0),
+    }[size]
+    if base != (major, minor, patch):
+        return "{}.{}.{}{}1".format(*base, letter)
+
+    order = list(STAGE_LETTERS.values())
+    if order.index(letter) < order.index(cur_letter):
+        die(
+            f"{ver} cannot step back to {stage} on the same base — "
+            f"open the next cycle instead (e.g. {stage}-minor)"
+        )
+    if letter == cur_letter:
+        return f"{major}.{minor}.{patch}{letter}{cur_n + 1}"
+    return f"{major}.{minor}.{patch}{letter}1"
+
+
+#: Stage name per PEP 440 letter — STAGE_LETTERS inverted.
+_LETTER_STAGES = {letter: stage for stage, letter in STAGE_LETTERS.items()}
+
+
+def auto_step(current: str, target: str) -> str:
+    """Resolve the ``auto`` bump level for one package.
+
+    Publishing targets promote: ``release`` strips the pre-release
+    suffix (and refuses a package that has none — an API-delta call the
+    chain can't make; spell that one out with ``%LEVEL``).  gh-only
+    runs stay inside the dev cycle: continue whatever stage the package
+    is on, or open a fresh alpha series from a final version.
+    """
+    m = _VER_RE.match(current) or die(f"unparseable version: {current}")
+    if target in ("pypi", "testpypi"):
+        if not m[4]:
+            die(
+                f"auto bump level: {current} is already final — 'release' has nothing "
+                f"to promote. Pass --version-step or a %LEVEL override for this package."
+            )
+        return "release"
+    return _LETTER_STAGES[m[4]] if m[4] else "alpha"
 
 
 def build_chain(start: str, end: str | None = None) -> list[str]:
@@ -287,7 +416,7 @@ class StepKind(StrEnum):
     VERSION_BUMP = "version_bump"
     DEP_UPDATE = "dep_update"
     CHANGELOG_UPDATE = "changelog_update"
-    POETRY_LOCK = "poetry_lock"
+    LOCK = "lock"
     GIT_COMMIT = "git_commit"
     GIT_PUSH = "git_push"
     PR_CREATE = "pr_create"
@@ -475,10 +604,10 @@ def sh(
 # Runtime deps live in PEP 621 ``[project.dependencies]`` as an array of
 # PEP 508 strings (``name @ url``, ``name>=X,<Y``, ``name @ git+url@ref``).
 # The chain script finds entries by their leading project name and rewrites
-# the whole string in place — Poetry's old ``[tool.poetry.dependencies]``
-# inline-table form is no longer accepted.  ``[tool.poetry].version``
-# stays as the dynvers fallback (``[project].dynamic = ["version"]``);
-# ``set_version_toml`` keeps writing there.
+# the whole string in place.  The no-git-metadata version fallback
+# (``[project].dynamic = ["version"]``) lives at
+# ``[tool.hatch.version].fallback-version`` (read by hatch-vcs);
+# ``set_version_toml`` writes it.
 
 
 _PEP508_NAME_RE = re.compile(r"^\s*([A-Za-z0-9][A-Za-z0-9._-]*)")
@@ -511,16 +640,20 @@ def _find_dep_index(deps: Any, dep_repo: str) -> int | None:
 
 
 def set_version_toml(path: Path, version: str):
-    """Set the version field in pyproject.toml.
+    """Set the no-git-metadata fallback version in pyproject.toml.
 
-    Lives at ``[tool.poetry].version`` even after the PEP 621 migration —
-    ``[project].dynamic = ["version"]`` tells Poetry the version is
-    dynamic, and ``poetry-dynamic-versioning`` reads it from here as the
-    fallback when no git tag is present.
+    The real release version always comes from the git tag; this field only
+    keeps tarball/no-git builds honest.  It lives at
+    ``[tool.hatch.version].fallback-version`` (read by hatch-vcs).
     """
     doc = tomlkit.parse(path.read_text())
-    doc["tool"]["poetry"]["version"] = version
+    doc["tool"]["hatch"]["version"]["fallback-version"] = version
     path.write_text(tomlkit.dumps(doc))
+
+
+def lock_repo(repo_dir: Path):
+    """Regenerate the repo's lockfile."""
+    sh("uv", "lock", cwd=repo_dir)
 
 
 def set_dep_url(path: Path, dep_repo: str, version: str, org: str):
@@ -548,10 +681,11 @@ def set_dep_pypi(path: Path, dep_repo: str, version: str):
     if idx is None:
         return
     name = _pep508_name(str(deps[idx])) or dep_repo
-    parts = [int(p) for p in version.split(".")]
-    major = parts[0]
-    minor = parts[1] if len(parts) > 1 else 0
-    patch = parts[2] if len(parts) > 2 else 0
+    # The floor keeps the full version (a pre-release floor is valid PEP
+    # 440 and admits its own pre-releases); the cap derives from the
+    # numeric triple alone.
+    m = _VER_RE.match(version) or die(f"unparseable version for {dep_repo}: {version}")
+    major, minor, patch = int(m[1]), int(m[2]), int(m[3])
     if major > 0:
         upper = f"{major + 1}.0.0"
     elif minor > 0:
@@ -998,12 +1132,42 @@ def squash_merge(pr_url: str, gh_repo: str) -> str:
                 die(
                     f"PR still not merged after {MERGE_RACE_POLL_COUNT * MERGE_RACE_POLL_INTERVAL}s"
                 )
+        elif "refusing to allow" in err and "workflow" in err:
+            return _await_manual_merge(pr_url, gh_repo)
         else:
             die(f"Merge failed: {err.strip()}")
 
     sha = _gh_merge_commit(pr_url, gh_repo)
     console.print(f"[green]Merged ({sha[:12]})[/]")
     return sha
+
+
+def _await_manual_merge(pr_url: str, gh_repo: str) -> str:
+    """Park the run while the operator merges a workflow-touching PR.
+
+    GitHub refuses API merges of PRs that change ``.github/workflows``
+    unless the token carries the ``workflow`` scope — a per-token
+    property this run cannot fix.  Recoverable exactly like a failing
+    check: alert the operator, hand them the PR, and poll until it is
+    merged in the browser (or with a stronger token).
+    """
+    console.bell()
+    console.print("\n[black on bright_yellow] INPUT NEEDED [/]")
+    console.print(
+        "[yellow]The token can't merge a PR that changes workflow files "
+        f"(no `workflow` scope). Merge it manually; the run continues once it lands:[/]\n"
+        f"  {pr_url}"
+    )
+    for _elapsed in range(0, MANUAL_MERGE_TIMEOUT, MANUAL_MERGE_POLL_INTERVAL):
+        match pr_state(pr_url, gh_repo):
+            case "MERGED":
+                sha = _gh_merge_commit(pr_url, gh_repo)
+                console.print(f"[green]Merged manually ({sha[:12]})[/]")
+                return sha
+            case "CLOSED":
+                die("PR closed without merging.")
+        time.sleep(MANUAL_MERGE_POLL_INTERVAL)
+    die(f"PR still not merged after {MANUAL_MERGE_TIMEOUT}s — resume the plan once it is.")
 
 
 def _wheel_downloadable(url: str) -> bool:
@@ -1021,7 +1185,7 @@ def wait_for_wheel(repo: str, version: str, org: str, timeout: int = DEFAULT_WHE
 
     Two-phase check: the GitHub API lists the asset name first, then the
     actual download URL goes live a few seconds later as the CDN
-    propagates.  Only both together mean consumers can poetry-resolve it.
+    propagates.  Only both together mean consumers can resolve it.
     """
     expected = wheel_filename(repo, version)
     url = wheel_url(org, repo, version)
@@ -1075,7 +1239,7 @@ def _find_release_run(gh_repo: str, ref: str, event: str) -> str:
     die(f"No release.yml run found for {gh_repo} ref {ref} (event={event})")
 
 
-def wait_for_release_run(gh_repo: str, run_id: str, ref: str, ctx: "Ctx") -> None:
+def wait_for_release_run(gh_repo: str, run_id: str, ref: str, ctx: Ctx) -> None:
     """Watch a ``release.yml`` run, alerting when it pauses for approval.
 
     GitHub's deployment-protection rules (required reviewers on the
@@ -1230,11 +1394,12 @@ def plan_steps(
     if do_release:
         add(StepKind.VERSION_BUMP, version=pkg.new_version)
         # Final releases prepend a `## vX.Y.Z — Title` section to
-        # ``CHANGELOG.md``; prereleases (alpha cuts) skip — they are
-        # cycle-internal integration tags, not user-facing release events.
+        # ``CHANGELOG.md``; prereleases (alpha/beta/rc cuts) skip — they
+        # are cycle-internal integration tags, not user-facing release
+        # events.
         if not prerelease:
             add(StepKind.CHANGELOG_UPDATE, version=pkg.new_version, title=name)
-    add(StepKind.POETRY_LOCK)
+    add(StepKind.LOCK)
     add(StepKind.GIT_COMMIT, message=commit_msg)
     add(StepKind.GIT_PUSH, branch=branch, fork=fork)
     if needs_new_pr:
@@ -1413,6 +1578,8 @@ def generate_plan(
 
         # Chain-wide default, overridden where the spec says ``%LEVEL``.
         level = (level_specs or {}).get(repo, version_step)
+        if level == "auto":
+            level = auto_step(current, target)
         new_ver = bump_version(current, level) if action != Action.DEPS_ONLY else None
 
         repo_deps = live_deps[repo]
@@ -1425,8 +1592,9 @@ def generate_plan(
             planned_pins[f"{repo}:{dep}"] = ver
 
         # Notes anchor: skip prereleases for final cuts so the summary
-        # spans the whole alpha cycle (not just the promotion diff); use
-        # the latest tag of any kind for alpha cuts (per-iteration delta).
+        # spans the whole pre-release cycle (not just the promotion
+        # diff); use the latest tag of any kind for alpha/beta/rc cuts
+        # (per-iteration delta).
         previous = (
             current
             if (prerelease or new_ver is None)
@@ -1506,25 +1674,16 @@ def _branch_matches_upstream(repo_dir: Path) -> bool:
     return head == tip
 
 
-# Poetry's version-solver phrasing for "the /simple/ index doesn't list any
-# version satisfying this constraint" — captures which dep it complained
-# about, so the lag triage can ask the JSON API whether that dep's
-# just-released version actually exists.
-_INDEX_LAG_RE = re.compile(
-    r"depends on ([A-Za-z0-9._-]+) \([^)]+\) which doesn't match any versions"
-)
-
-
 def _canonical(name: str) -> str:
-    """PEP 503 name normalisation — Poetry's solver output vs. our repo names."""
+    """PEP 503 name normalisation — resolver output vs. our repo names."""
     return name.lower().replace("_", "-")
 
 
 def _pypi_pinned_deps(package: str, plan: Plan) -> dict[str, str]:
     """Sibling deps this plan pypi-pins for *package*, canonical name → version.
 
-    These are the versions *package*'s ``poetry lock`` must be able to
-    see on the index; a solver complaint about anything else is not
+    These are the versions *package*'s ``uv lock`` must be able to
+    see on the index; a resolver complaint about anything else is not
     release-propagation lag.
     """
     return {
@@ -1536,48 +1695,43 @@ def _pypi_pinned_deps(package: str, plan: Plan) -> dict[str, str]:
     }
 
 
-def poetry_lock_riding_index_lag(
+def lock_riding_index_lag(
     repo_dir: Path, pins: dict[str, str], target: str, timeout: int = LOCK_INDEX_LAG_TIMEOUT
 ) -> None:
-    """Run ``poetry lock``, riding out PyPI simple-index propagation lag.
+    """Run ``uv lock``, riding out PyPI simple-index propagation lag.
 
     The publish gate (``wait_for_pypi``) polls PyPI's JSON API — the
-    authoritative "this release exists" signal.  Poetry, however,
-    resolves from the separately rendered ``/simple/`` index, whose CDN
-    copy can lag the JSON API by minutes right after an upload.  Worse,
-    Poetry caches whichever page it saw for its full ``max-age``
-    (10 min), so a bare retry re-fails instantly from the local cache
-    without ever touching the network.
+    authoritative "this release exists" signal.  uv, however, resolves
+    from the separately rendered ``/simple/`` index, whose CDN copy can
+    lag the JSON API by minutes right after an upload.
 
-    Polling therefore has to be earned: the solver must have complained
-    about a dep this plan pinned (*pins*), and the JSON API must confirm
-    the pinned version exists — only then is there actually something to
-    wait for.  Each retry drops Poetry's repository cache first (the
-    name is exactly ``PyPI`` — lowercase silently clears nothing).  Any
-    other failure dies immediately, like a plain checked ``sh`` call.
+    Polling therefore has to be earned: uv's resolver prose varies too
+    much for one complaint regex, so the failure must at least mention
+    a dep this plan pinned (*pins*), and the JSON API must confirm
+    every mentioned pin exists — only then is there actually something
+    to wait for.  Retries pass ``--refresh``, which bypasses uv's
+    cached index pages wholesale.  Any other failure dies immediately,
+    like a plain checked ``sh`` call.
     """
     for _elapsed in range(0, timeout, LOCK_INDEX_LAG_RETRY_INTERVAL):
-        r = sh("poetry", "lock", cwd=repo_dir, check=False)
+        refresh = ["--refresh"] if _elapsed else []
+        r = sh("uv", "lock", *refresh, cwd=repo_dir, check=False)
         if r.returncode == 0:
             return
-        failure = f"Command failed (exit {r.returncode}): poetry lock\n{r.stderr.strip()}"
-        # Collapse whitespace first — the solver wraps long lines at terminal width.
-        complaint = _INDEX_LAG_RE.search(" ".join(r.stderr.split()))
-        if not complaint:
+        failure = f"Command failed (exit {r.returncode}): uv lock\n{r.stderr.strip()}"
+        stderr_flat = _canonical(" ".join(r.stderr.split()))
+        mentioned = {dep: ver for dep, ver in pins.items() if dep in stderr_flat}
+        if not mentioned:
             die(failure)
-        dep = _canonical(complaint.group(1))
-        version = pins.get(dep)
-        if version is None:
-            die(f"{failure}\n({dep} is not a dep this plan pinned — nothing to wait for)")
-        if not pypi_has(dep, version, target):
-            die(f"{failure}\n({dep} {version} is not on {target} at all — nothing to wait for)")
+        for dep, version in mentioned.items():
+            if not pypi_has(dep, version, target):
+                die(f"{failure}\n({dep} {version} is not on {target} at all — nothing to wait for)")
         console.print(
-            f"[yellow]{dep} {version} is on {target}'s JSON API but not its /simple/ index "
-            f"yet — clearing Poetry's cache, retrying in {LOCK_INDEX_LAG_RETRY_INTERVAL}s...[/]"
+            f"[yellow]{', '.join(mentioned)} on {target}'s JSON API but uv cannot resolve yet "
+            f"— retrying with --refresh in {LOCK_INDEX_LAG_RETRY_INTERVAL}s...[/]"
         )
-        sh("poetry", "cache", "clear", "PyPI", "--all", "-n", cwd=repo_dir, check=False)
         time.sleep(LOCK_INDEX_LAG_RETRY_INTERVAL)
-    die(f"poetry lock still failing after {timeout}s of index-lag retries")
+    die(f"uv lock still failing after {timeout}s of index-lag retries")
 
 
 def execute_step(step: Step, plan: Plan, ctx: Ctx):
@@ -1604,6 +1758,13 @@ def execute_step(step: Step, plan: Plan, ctx: Ctx):
 
         case StepKind.VERSION_BUMP:
             set_version_toml(repo_dir / "pyproject.toml", p["version"])
+            # A repo may lock-step other files to its version (mkdocs-terok's
+            # README install snippet); such repos ship the sync as
+            # scripts/check-readme-version.py --write, which no-ops on
+            # pre-releases so the README keeps advertising the last final.
+            readme_sync = repo_dir / "scripts" / "check-readme-version.py"
+            if readme_sync.exists():
+                sh("python3", str(readme_sync), "--write", cwd=repo_dir)
 
         case StepKind.DEP_UPDATE:
             # Plans generated before the pin-style flag landed don't carry
@@ -1633,15 +1794,15 @@ def execute_step(step: Step, plan: Plan, ctx: Ctx):
                 return
             prepend_changelog(changelog, p["version"], p.get("title", ""), notes.read_text())
 
-        case StepKind.POETRY_LOCK:
-            poetry_lock_riding_index_lag(
-                repo_dir, _pypi_pinned_deps(step.package, plan), plan.target
-            )
+        case StepKind.LOCK:
+            lock_riding_index_lag(repo_dir, _pypi_pinned_deps(step.package, plan), plan.target)
 
         case StepKind.GIT_COMMIT:
-            paths = ["pyproject.toml", "poetry.lock"]
+            paths = ["pyproject.toml", "uv.lock"]
             if (repo_dir / "CHANGELOG.md").exists():
                 paths.append("CHANGELOG.md")
+            if (repo_dir / "scripts" / "check-readme-version.py").exists():
+                paths.append("README.md")
             sh("git", "add", *paths, cwd=repo_dir)
             # Idempotent: HEAD already carries this commit message (re-run of a
             # previously-committed step), or nothing is staged (a prior feature
@@ -1860,6 +2021,16 @@ def execute_plan(plan: Plan, *, mode: ExecMode, ctx: Ctx) -> Plan:
         try:
             execute_step(step, plan, ctx)
             step.status = "completed"
+        except (KeyboardInterrupt, click.exceptions.Abort):
+            # Ctrl-C at a park/prompt is a deliberate "not now", not a
+            # crash — leave the operator holding the resume command.
+            step.status = "failed"
+            step.result["error"] = "interrupted (Ctrl-C)"
+            if ctx.plan_path:
+                save_plan(plan, ctx.plan_path)
+                console.print(f"\n[yellow]Interrupted — plan state saved:[/] {ctx.plan_path}")
+                console.print(f"[yellow]Resume with: terok-release execute {ctx.plan_path}[/]")
+            raise
         except (subprocess.CalledProcessError, SystemExit) as exc:
             step.status = "failed"
             step.result["error"] = str(exc)
@@ -1970,12 +2141,13 @@ def _split_level(part: str) -> tuple[str, str | None]:
     if "%" not in part:
         return part, None
     rest, level = part.rsplit("%", 1)
-    if level not in VERSION_STEPS:
+    if level not in ACCEPTED_STEPS:
         die(
             f"Bad bump level in '{part}': %LEVEL must end the entry, "
-            f"LEVEL one of {', '.join(VERSION_STEPS)}"
+            f"LEVEL one of {', '.join(VERSION_STEPS)} "
+            f"(shortcuts: {', '.join(STEP_SHORTCUTS)})"
         )
-    return rest, level
+    return rest, canonical_step(level)
 
 
 def parse_chain_spec(spec: str) -> list[ChainEntry]:
@@ -2218,14 +2390,23 @@ _chain_options = _stack(
     click.argument("chain_spec"),
     click.option(
         "--version-step",
-        default="patch",
-        type=click.Choice(list(VERSION_STEPS)),
+        default="auto",
+        type=click.Choice(["auto", *ACCEPTED_STEPS]),
         help=(
             "Default bump level; a ``%LEVEL`` suffix in the chain spec "
-            "overrides it per package. ``alpha`` cuts a PEP 440 "
-            "pre-release tag (``X.Y.ZaN``) for dev-cycle integration — "
-            "gh-only, marked as a GH prerelease.  Other levels applied "
-            "to an alpha base promote (drop the suffix)."
+            "overrides it per package. ``auto`` (the default) follows "
+            "the target: pypi/testpypi promote each package's "
+            "pre-release in place (``release``; a package already final "
+            "must be spelled out), gh-only continues each package's "
+            "running stage or opens a fresh alpha from a final. "
+            "``alpha``/``beta``/``rc`` cut PEP 440 pre-release tags "
+            "(``X.Y.ZaN``/``bN``/``rcN``) for dev-cycle integration — "
+            "gh-only, marked as GH prereleases; an optional "
+            "``-patch``/``-minor``/``-major`` suffix picks the base "
+            "bump (bare stage = ``-patch``). ``release`` strips a "
+            "pre-release suffix in place; other final levels applied "
+            "to a pre-release base promote (drop the suffix). "
+            "Shortcuts: maj min rel a amin amaj b bmin bmaj rcmin rcmaj."
         ),
     ),
     click.option("-n", "--name", "release_name", default="", help="Release name suffix"),
@@ -2256,28 +2437,30 @@ _chain_options = _stack(
 """Chain-spec positional + planner options shared by ``quick`` and ``plan``."""
 
 
-def _resolve_alpha_constraints(
+def _resolve_prerelease_constraints(
     levels: set[str], target: str, prerelease: bool
 ) -> tuple[str, bool]:
-    """Apply the ``alpha`` bump level's implications.
+    """Apply the pre-release bump levels' implications.
 
-    Alpha tags are dev-cycle integration artefacts: always gh-only and
-    always GH prereleases.  Those are plan-wide switches, so *levels* —
-    the effective bump level of every package releasing in this run —
-    must be all-alpha or alpha-free; a mix can't honour both halves.
+    Alpha/beta/rc tags are dev-cycle integration artefacts: always
+    gh-only and always GH prereleases.  Those are plan-wide switches, so
+    *levels* — the effective bump level of every package releasing in
+    this run — must be all-pre-release or pre-release-free; a mix can't
+    honour both halves (stages and base sizes may vary freely).
     Explicit pypi/testpypi targets are rejected up front.
     """
-    if "alpha" not in levels:
+    pre = {level for level in levels if level not in FINAL_STEPS}
+    if not pre:
         return target, prerelease
-    if levels != {"alpha"}:
+    if pre != levels:
         die(
-            "alpha can't mix with final bump levels in one run — the gh-only "
-            "prerelease implications are plan-wide. Split the release, or make it all-alpha."
+            "pre-release bump levels (alpha/beta/rc) can't mix with final levels in one "
+            "run — the gh-only prerelease implications are plan-wide. Split the release."
         )
     if target in ("pypi", "testpypi"):
         die(
-            f"an alpha bump level is incompatible with --target={target} — "
-            "alpha tags are gh-only by design. Drop the suffix to publish to PyPI."
+            f"a pre-release bump level is incompatible with --target={target} — "
+            "alpha/beta/rc tags are gh-only by design. Use a final level to publish to PyPI."
         )
     return "gh-only", True
 
@@ -2383,8 +2566,20 @@ def quick(
     )
     assert _pr_specs == pr_specs  # invariant: both extractions agree
 
-    releasing_levels = {level_specs.get(r, version_step) for r in chain if r != stop_at}
-    target, prerelease = _resolve_alpha_constraints(releasing_levels, target, prerelease)
+    # ``auto`` classifies by target alone (promote on publishing targets,
+    # stay pre-release on gh-only) — exact per-package levels resolve
+    # against current versions later, but the plan-wide implications are
+    # already decided here.
+    releasing_levels = {
+        canonical_step(
+            ("release" if target in ("pypi", "testpypi") else "alpha")
+            if (lv := level_specs.get(r, version_step)) == "auto"
+            else lv
+        )
+        for r in chain
+        if r != stop_at
+    }
+    target, prerelease = _resolve_prerelease_constraints(releasing_levels, target, prerelease)
     pin_style = _resolve_pin_style(pin_style, target)
     plan = generate_plan(
         chain,
@@ -2454,9 +2649,9 @@ def quick(
 def open_chain(branch, repos, pretend, org, fork, cache_dir):
     """Open a PR chain for cross-cutting development.
 
-    Creates a branch in each repo, wires sibling deps as Poetry git-branch
-    references, and opens PRs.  During an open chain, use `poetry install`
-    for development — not pipx.
+    Creates a branch in each repo, wires sibling deps as git-branch
+    references (PEP 508), and opens PRs.  During an open chain, develop
+    with the repo's own locker — `uv sync` — not pipx.
 
     \b
     Examples:
@@ -2492,8 +2687,8 @@ def open_chain(branch, repos, pretend, org, fork, cache_dir):
                     if not ctx.dry_run:
                         set_branch_dep(repo_dir / "pyproject.toml", dep, branch, fork)
             if not ctx.dry_run:
-                sh("poetry", "lock", cwd=repo_dir)
-                sh("git", "add", "pyproject.toml", "poetry.lock", cwd=repo_dir)
+                lock_repo(repo_dir)
+                sh("git", "add", "pyproject.toml", "uv.lock", cwd=repo_dir)
                 sh("git", "commit", "-m", f"chore: wire {branch} branch deps", cwd=repo_dir)
 
         console.print("  pushing to fork")
@@ -2594,8 +2789,20 @@ def plan_cmd(
     )
     assert _pr_specs == pr_specs  # invariant: both extractions agree
 
-    releasing_levels = {level_specs.get(r, version_step) for r in chain if r != stop_at}
-    target, prerelease = _resolve_alpha_constraints(releasing_levels, target, prerelease)
+    # ``auto`` classifies by target alone (promote on publishing targets,
+    # stay pre-release on gh-only) — exact per-package levels resolve
+    # against current versions later, but the plan-wide implications are
+    # already decided here.
+    releasing_levels = {
+        canonical_step(
+            ("release" if target in ("pypi", "testpypi") else "alpha")
+            if (lv := level_specs.get(r, version_step)) == "auto"
+            else lv
+        )
+        for r in chain
+        if r != stop_at
+    }
+    target, prerelease = _resolve_prerelease_constraints(releasing_levels, target, prerelease)
     pin_style = _resolve_pin_style(pin_style, target)
     plan = generate_plan(
         chain,
