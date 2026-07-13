@@ -173,6 +173,13 @@ LOCK_INDEX_LAG_TIMEOUT = 600  # 10 min — one full max-age of PyPI's /simple/ p
 LOCK_INDEX_LAG_RETRY_INTERVAL = 5
 WORKFLOW_DISCOVERY_POLL_INTERVAL = 2
 WORKFLOW_DISCOVERY_TIMEOUT = 60  # seconds to wait for the release.yml run to register
+#: How far back to look for runs already attached to a tag (a retried
+#: release re-uses the tag, so its earlier attempts are still listed).
+RELEASE_RUN_HISTORY_LIMIT = 20
+#: The publish jobs hard-fail unless this account triggered them (the
+#: `pypi` environment narrows the OIDC subject to it); checking up front
+#: turns a mid-run failure into a refusal to start.
+PYPI_TRIGGERING_ACTOR = "terok-warden"
 
 MERGE_RACE_POLL_COUNT = 15
 MERGE_RACE_POLL_INTERVAL = 2
@@ -1210,33 +1217,46 @@ def wait_for_wheel(repo: str, version: str, org: str, timeout: int = DEFAULT_WHE
 # ── PyPI / Trusted-Publishing helpers ─────────────────────────────────────
 
 
-def _find_release_run(gh_repo: str, ref: str, event: str) -> str:
-    """Return the most recent ``release.yml`` run for *ref* fired by *event*.
+def _release_run_ids(gh_repo: str, ref: str, event: str) -> set[str]:
+    """Every ``release.yml`` run id already recorded for *ref* + *event*."""
+    r = sh(
+        "gh", "run", "list",
+        "--repo", gh_repo,
+        "--workflow", "release.yml",
+        "--event", event,
+        "--branch", ref,
+        "--limit", str(RELEASE_RUN_HISTORY_LIMIT),
+        "--json", "databaseId",
+        capture=True, check=False,
+    )  # fmt: skip
+    if r.returncode != 0 or not r.stdout.strip():
+        return set()
+    return {str(run["databaseId"]) for run in json.loads(r.stdout)}
 
-    Polls briefly because the run takes a moment to register after a
-    tag push (auto-trigger) or ``gh workflow run`` (dispatch). ``ref``
-    is the tag name without the ``refs/tags/`` prefix; ``event`` is one
-    of ``"push"`` (for ``target=pypi`` — auto-triggered run) or
-    ``"workflow_dispatch"`` (for ``target=testpypi`` or ``target=gh-only``
-    — script-dispatched).
+
+def _find_release_run(gh_repo: str, ref: str, event: str, *, seen: set[str]) -> str:
+    """Return the ``release.yml`` run for *ref* that this run just started.
+
+    Polls because the run takes a moment to register after a tag push
+    (auto-trigger) or ``gh workflow run`` (dispatch).  *seen* is the set
+    of run ids that existed **before** we triggered: a retried release
+    (deleted tag, re-pushed, re-dispatched) leaves the earlier attempt's
+    runs attached to the very same tag, and the newest-first listing
+    hands one of those back long before the fresh run appears -- so the
+    script would watch, and fail on, a run it did not start.  Ignoring
+    the pre-existing ids is what makes the wait honest.
+
+    ``ref`` is the tag name without the ``refs/tags/`` prefix; ``event``
+    is ``"push"`` (auto-triggered) or ``"workflow_dispatch"``.
     """
     for _ in range(0, WORKFLOW_DISCOVERY_TIMEOUT, WORKFLOW_DISCOVERY_POLL_INTERVAL):
-        r = sh(
-            "gh", "run", "list",
-            "--repo", gh_repo,
-            "--workflow", "release.yml",
-            "--event", event,
-            "--branch", ref,            # head_branch == tag for both events
-            "--limit", "1",
-            "--json", "databaseId,status",
-            capture=True, check=False,
-        )  # fmt: skip
-        if r.returncode == 0 and r.stdout.strip():
-            runs = json.loads(r.stdout)
-            if runs:
-                return str(runs[0]["databaseId"])
+        fresh = _release_run_ids(gh_repo, ref, event) - seen
+        if fresh:
+            # More than one only if something else dispatched concurrently;
+            # the newest is still the one our dispatch produced.
+            return max(fresh, key=int)
         time.sleep(WORKFLOW_DISCOVERY_POLL_INTERVAL)
-    die(f"No release.yml run found for {gh_repo} ref {ref} (event={event})")
+    die(f"No new release.yml run found for {gh_repo} ref {ref} (event={event})")
 
 
 def wait_for_release_run(gh_repo: str, run_id: str, ref: str, ctx: Ctx) -> None:
@@ -1679,6 +1699,14 @@ def _canonical(name: str) -> str:
     return name.lower().replace("_", "-")
 
 
+def _dispatch_runs_before(plan: Plan, package: str) -> list[str]:
+    """Run ids *package*'s WORKFLOW_DISPATCH step saw before it triggered."""
+    for s in plan.steps:
+        if s.package == package and s.kind == StepKind.WORKFLOW_DISPATCH:
+            return list(s.result.get("runs_before", []))
+    return []
+
+
 def _pypi_pinned_deps(package: str, plan: Plan) -> dict[str, str]:
     """Sibling deps this plan pypi-pins for *package*, canonical name → version.
 
@@ -1960,6 +1988,12 @@ def execute_step(step: Step, plan: Plan, ctx: Ctx):
             wait_for_wheel(step.package, p["version"], plan.gh_org, ctx.wheel_timeout)
 
         case StepKind.WORKFLOW_DISPATCH:
+            # Snapshot the runs this tag already has: a retry after a
+            # failed attempt (tag deleted and re-pushed) leaves them
+            # behind, and the wait step must not adopt one of those.
+            step.result["runs_before"] = sorted(
+                _release_run_ids(gh_repo, p["ref"], "workflow_dispatch")
+            )
             sh(
                 "gh", "workflow", "run", "release.yml",
                 "--repo", gh_repo,
@@ -1971,7 +2005,8 @@ def execute_step(step: Step, plan: Plan, ctx: Ctx):
             # The pypi-publish and testpypi-publish jobs are dispatched
             # explicitly by the preceding WORKFLOW_DISPATCH step — we
             # never wait on a push-triggered run for those jobs.
-            run_id = _find_release_run(gh_repo, p["ref"], "workflow_dispatch")
+            seen = set(_dispatch_runs_before(plan, step.package))
+            run_id = _find_release_run(gh_repo, p["ref"], "workflow_dispatch", seen=seen)
             step.result["run_id"] = run_id
             wait_for_release_run(gh_repo, run_id, p["ref"], ctx)
 
@@ -2437,6 +2472,33 @@ _chain_options = _stack(
 """Chain-spec positional + planner options shared by ``quick`` and ``plan``."""
 
 
+def _assert_publisher_identity(target: str) -> None:
+    """Refuse a publishing run the gh account is not allowed to trigger.
+
+    The publish jobs verify ``github.triggering_actor`` and the ``pypi``
+    environment narrows the OIDC subject to the same account, so a run
+    started by anyone else fails *after* the tag is pushed and the GitHub
+    release is created -- leaving a half-released package to clean up by
+    hand.  The account is a property of the gh credential, knowable
+    before a single side effect: check it up front and refuse.
+    """
+    if target not in ("pypi", "testpypi"):
+        return
+    r = sh("gh", "api", "user", "--jq", ".login", capture=True, check=False)
+    actor = r.stdout.strip()
+    if r.returncode != 0 or not actor:
+        die("cannot determine the gh account (gh api user failed) — is gh authenticated?")
+    if actor != PYPI_TRIGGERING_ACTOR:
+        die(
+            f"--target={target} must be triggered by {PYPI_TRIGGERING_ACTOR}, but this gh "
+            f"credential is {actor!r}.\n"
+            f"The publish job checks github.triggering_actor and would fail after the tag "
+            f"and GitHub release already exist.\n"
+            f"Switch credentials (GH_TOKEN / gh auth switch), or use --target=gh-only."
+        )
+    console.print(f"[dim]publishing as {actor} — matches the release workflow's gate[/]")
+
+
 def _resolve_prerelease_constraints(
     levels: set[str], target: str, prerelease: bool
 ) -> tuple[str, bool]:
@@ -2580,6 +2642,7 @@ def quick(
         if r != stop_at
     }
     target, prerelease = _resolve_prerelease_constraints(releasing_levels, target, prerelease)
+    _assert_publisher_identity(target)
     pin_style = _resolve_pin_style(pin_style, target)
     plan = generate_plan(
         chain,
@@ -2803,6 +2866,7 @@ def plan_cmd(
         if r != stop_at
     }
     target, prerelease = _resolve_prerelease_constraints(releasing_levels, target, prerelease)
+    _assert_publisher_identity(target)
     pin_style = _resolve_pin_style(pin_style, target)
     plan = generate_plan(
         chain,
