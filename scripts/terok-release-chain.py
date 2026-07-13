@@ -1410,7 +1410,12 @@ def plan_steps(
     if pkg.action == Action.RELEASE_PR:
         add(StepKind.PR_LABEL, label=AUTOMATED_RELEASE_LABEL)
     for dep, ver in pkg.sibling_deps.items():
-        add(StepKind.DEP_UPDATE, dep_repo=dep, dep_version=ver, pin_style=pin_style)
+        add(
+            StepKind.DEP_UPDATE,
+            dep_repo=dep,
+            dep_version=ver,
+            pin_style=_dep_pin_style(pin_style, dep, ver, org),
+        )
     if do_release:
         add(StepKind.VERSION_BUMP, version=pkg.new_version)
         # Final releases prepend a `## vX.Y.Z — Title` section to
@@ -2525,6 +2530,29 @@ def _resolve_prerelease_constraints(
             "alpha/beta/rc tags are gh-only by design. Use a final level to publish to PyPI."
         )
     return "gh-only", True
+
+
+def _dep_pin_style(plan_style: str, dep: str, version: str, org: str) -> str:
+    """Pin style for one sibling dep — a released final always comes from PyPI.
+
+    URL pins exist because pre-releases are gh-only: they never reach
+    PyPI, so a consumer cannot name them any other way.  A *final* has no
+    such excuse -- it is on PyPI, and a range is both cleaner and what the
+    promotion would write anyway.
+
+    The distinction matters during a bottom-up promotion, which every
+    release cycle passes through: the moment the foundation goes final
+    while its consumers are still cutting alphas, a plan-wide URL style
+    would re-pin the fresh final by URL -- and the *next* layer up, which
+    asks for that final by range, cannot satisfy a direct reference to a
+    pre-release wheel (terok-ai/terok-util 0.3.0 vs the 0.3.0a7 URL its
+    consumers' published wheels carried).  Verified against the index
+    rather than assumed: a final that somehow is not on PyPI (a gh-only
+    final cut) keeps the URL pin.
+    """
+    if plan_style != "url" or _VER_RE.match(version).group(4):
+        return plan_style
+    return "pypi" if pypi_has(dep, version, "pypi") else "url"
 
 
 def _resolve_pin_style(pin_style: str | None, target: str) -> str:
