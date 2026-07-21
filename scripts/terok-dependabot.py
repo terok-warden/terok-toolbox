@@ -28,9 +28,14 @@ that is machine-reliable and consistent fleet-wide:
 
 Merge mechanics the fleet imposes (verified against branch settings):
 
-* ``master`` has no branch protection, so ``gh pr merge`` would happily
-  land a red PR — this tool gates on ``gh pr checks`` itself rather than
-  trusting the merge-state.
+* Every ``master`` carries a branch-protection ruleset, but none require a
+  status check — so ``gh pr merge`` would still land a red PR.  The tool
+  gates on ``gh pr checks`` itself rather than trusting the merge-state.
+* That same ruleset (or a repo's Copilot-review rule) can leave a PR
+  ``BLOCKED`` even when it is green and mergeable: a normal merge is
+  refused and only an admin bypass — the web merge button — clears it.
+  Policy is never to bypass, so such PRs are skipped and reported at the
+  end as needing an admin/manual merge.
 * The CI PRs edit ``.github/workflows/*``; GitHub refuses to let a token
   without ``workflow`` scope merge those.  A preflight reports the gap up
   front and the merge loop degrades gracefully if it is hit anyway.
@@ -309,13 +314,19 @@ def render_summary(prs: list[PR]) -> tuple[list[PR], list[PR]]:
     return everything_else, runtime
 
 
-def refresh(pr: PR) -> tuple[str, str]:
-    """Re-read a PR's live (state, mergeable) — state is MERGED/CLOSED/OPEN."""
+def refresh(pr: PR) -> tuple[str, str, str]:
+    """Re-read a PR's live (state, mergeable, mergeStateStatus).
+
+    ``state`` is MERGED/CLOSED/OPEN; ``mergeStateStatus`` is CLEAN/BLOCKED/
+    BEHIND/… — BLOCKED means a normal merge is refused even when the PR is
+    mergeable and green (branch-protection ruleset or a pending Copilot
+    review), clearable only by an admin bypass.
+    """
     data = gh_json(
         "pr", "view", str(pr.number), "--repo", pr.gh_repo,
-        "--json", "state,mergeable",
+        "--json", "state,mergeable,mergeStateStatus",
     )
-    return data["state"], data["mergeable"]
+    return data["state"], data["mergeable"], data["mergeStateStatus"]
 
 
 def check_buckets(pr: PR) -> list[dict]:
@@ -367,7 +378,7 @@ def wait_mergeable(pr: PR, timeout: int) -> str:
     """
     nudged = False
     for elapsed in range(0, timeout, REBASE_POLL_INTERVAL):
-        state, mergeable = refresh(pr)
+        state, mergeable, _ = refresh(pr)
         if state == "MERGED":
             return "merged"
         if state == "CLOSED":
@@ -420,7 +431,8 @@ def _merge_one(pr: PR, ctx: MergeCtx) -> str:
     """Drive a single PR to merged: wait mergeable, gate on green, merge.
 
     Returns ``merged``, ``skipped`` (conflict timed out / already gone /
-    red-and-declined) or ``failed``.
+    red-and-declined), ``blocked`` (green + mergeable but branch protection
+    refuses a normal merge) or ``failed``.
     """
     outcome = wait_mergeable(pr, REBASE_TIMEOUT)
     if outcome == "merged":
@@ -449,6 +461,17 @@ def _merge_one(pr: PR, ctx: MergeCtx) -> str:
             return "skipped"
         admin = True
 
+    # Green and mergeable, yet a branch-protection ruleset (or a pending
+    # Copilot review) can leave the PR BLOCKED: a normal merge is refused
+    # and only an admin bypass — the web merge button — clears it.  Policy
+    # is never to bypass, so skip and let the end-of-run report flag it.
+    if not admin and refresh(pr)[2] == "BLOCKED":
+        console.print(
+            f"  [yellow]{pr.ref} is green + mergeable but BLOCKED[/] "
+            "(branch protection / pending Copilot review) — needs admin merge"
+        )
+        return "blocked"
+
     return "merged" if merge_pr(pr, admin=admin) else "failed"
 
 
@@ -458,16 +481,27 @@ def automerge(prs: list[PR], ctx: MergeCtx) -> None:
         console.print("[green]Nothing to automerge.[/]")
         return
     console.print(f"\n[bold]Automerging {len(prs)} everything-else PR(s)[/]")
-    tally = {"merged": 0, "skipped": 0, "failed": 0}
+    tally = {"merged": 0, "skipped": 0, "blocked": 0, "failed": 0}
+    blocked: list[PR] = []
     for pr in sorted(prs, key=lambda p: (p.repo, p.number)):
         console.print(f"\n[bold]{pr.ref}[/] — {pr.title}")
-        tally[_merge_one(pr, ctx)] += 1
+        result = _merge_one(pr, ctx)
+        tally[result] += 1
+        if result == "blocked":
+            blocked.append(pr)
     console.print(
         f"\n[bold]Automerge done:[/] "
         f"[green]{tally['merged']} merged[/], "
         f"{tally['skipped']} skipped, "
+        f"[yellow]{tally['blocked']} blocked[/], "
         f"[red]{tally['failed']} failed[/]"
     )
+    if blocked:
+        refs = ", ".join(pr.ref for pr in blocked)
+        console.print(
+            f"[yellow]Needs admin/manual merge[/] (green but branch-protection "
+            f"BLOCKED): {refs}"
+        )
 
 
 def offer_runtime(prs: list[PR], ctx: MergeCtx) -> None:
