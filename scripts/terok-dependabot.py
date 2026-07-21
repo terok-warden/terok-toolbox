@@ -260,9 +260,17 @@ def workflow_scope() -> str:
 _CHECK_STYLE = {"pass": "green", "pending": "yellow", "fail": "red", "none": "dim"}
 _MERGE_STYLE = {"MERGEABLE": "green", "CONFLICTING": "red", "UNKNOWN": "yellow"}
 
+# Runtime deps reach shipped installs — accent their PR refs in a distinct
+# colour so the operator reads them as "look before you merge", not routine.
+RUNTIME_ACCENT = "magenta"
 
-def _bucket_table(title: str, prs: list[PR]) -> Table:
-    """Render one bucket's PRs as a rich table."""
+
+def _bucket_table(title: str, prs: list[PR], *, ref_style: str = "default") -> Table:
+    """Render one bucket's PRs as a rich table.
+
+    ``ref_style`` colours the PR-reference column — the runtime bucket
+    passes an accent to flag that these need a closer look.
+    """
     table = Table(title=title, title_justify="left", header_style="bold", expand=False)
     table.add_column("PR")
     table.add_column("kind")
@@ -271,7 +279,7 @@ def _bucket_table(title: str, prs: list[PR]) -> Table:
     table.add_column("title", overflow="fold")
     for pr in sorted(prs, key=lambda p: (p.repo, p.number)):
         table.add_row(
-            pr.ref,
+            f"[{ref_style}]{pr.ref}[/]",
             pr.bucket.label,
             f"[{_MERGE_STYLE.get(pr.mergeable, 'default')}]{pr.mergeable}[/]",
             f"[{_CHECK_STYLE[pr.checks]}]{pr.checks}[/]",
@@ -297,7 +305,7 @@ def render_summary(prs: list[PR]) -> tuple[list[PR], list[PR]]:
     if everything_else:
         console.print(_bucket_table("Everything else — automerge", everything_else))
     if runtime:
-        console.print(_bucket_table("Runtime deps — review", runtime))
+        console.print(_bucket_table("Runtime deps — review", runtime, ref_style=RUNTIME_ACCENT))
     return everything_else, runtime
 
 
@@ -463,21 +471,30 @@ def automerge(prs: list[PR], ctx: MergeCtx) -> None:
 
 
 def offer_runtime(prs: list[PR], ctx: MergeCtx) -> None:
-    """Offer to walk the runtime deps one-by-one; otherwise leave them listed.
+    """Re-list the runtime deps, then offer to merge them.
 
-    They are already shown in the summary table, so a declined offer just
-    leaves them open for consideration.
+    Runtime deps ship to end users, so they get their own deliberate
+    step: the bucket is printed once more (accented) right before the
+    prompt, which offers merge-all, one-by-one, or skip.  Either merge
+    path still runs each PR through the green-gate, so "all" is not a
+    blind land — a red PR still stops for a decision.
     """
     if not prs:
         return
-    if not click.confirm(
-        f"\nReview {len(prs)} runtime dep(s) one-by-one now?", default=False
-    ):
+    console.print(_bucket_table(
+        "Runtime deps — merge with care", prs, ref_style=RUNTIME_ACCENT
+    ))
+    console.print(f"\n[{RUNTIME_ACCENT}]{len(prs)} runtime dep(s)[/] reach shipped installs.")
+    choice = click.prompt(
+        "  merge [a]ll, [o]ne-by-one, or [s]kip?",
+        type=click.Choice(["a", "o", "s"]), default="s", show_default=True,
+    )
+    if choice == "s":
         console.print("[dim]Runtime deps left open for consideration.[/]")
         return
     for pr in sorted(prs, key=lambda p: (p.repo, p.number)):
-        console.print(f"\n[bold]{pr.ref}[/] — {pr.title}")
-        if not click.confirm("  merge this runtime dep?", default=False):
+        console.print(f"\n[{RUNTIME_ACCENT}]{pr.ref}[/] — {pr.title}")
+        if choice == "o" and not click.confirm("  merge this runtime dep?", default=False):
             console.print("  [dim]left open[/]")
             continue
         _merge_one(pr, ctx)
