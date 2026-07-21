@@ -31,11 +31,10 @@ Merge mechanics the fleet imposes (verified against branch settings):
 * Every ``master`` carries a branch-protection ruleset, but none require a
   status check — so ``gh pr merge`` would still land a red PR.  The tool
   gates on ``gh pr checks`` itself rather than trusting the merge-state.
-* That same ruleset (or a repo's Copilot-review rule) can leave a PR
-  ``BLOCKED`` even when it is green and mergeable: a normal merge is
-  refused and only an admin bypass — the web merge button — clears it.
-  Policy is never to bypass, so such PRs are skipped and reported at the
-  end as needing an admin/manual merge.
+* That same ruleset can leave a PR ``BLOCKED`` even when it is green and
+  mergeable: a normal merge is refused and only an admin bypass — the web
+  merge button — clears it.  Policy is never to bypass, so such PRs are
+  skipped and reported at the end as needing an admin/manual merge.
 * The CI PRs edit ``.github/workflows/*``; GitHub refuses to let a token
   without ``workflow`` scope merge those.  A preflight reports the gap up
   front and the merge loop degrades gracefully if it is hit anyway.
@@ -319,8 +318,8 @@ def refresh(pr: PR) -> tuple[str, str, str]:
 
     ``state`` is MERGED/CLOSED/OPEN; ``mergeStateStatus`` is CLEAN/BLOCKED/
     BEHIND/… — BLOCKED means a normal merge is refused even when the PR is
-    mergeable and green (branch-protection ruleset or a pending Copilot
-    review), clearable only by an admin bypass.
+    mergeable and green (a branch-protection ruleset), clearable only by an
+    admin bypass.
     """
     data = gh_json(
         "pr", "view", str(pr.number), "--repo", pr.gh_repo,
@@ -461,14 +460,14 @@ def _merge_one(pr: PR, ctx: MergeCtx) -> str:
             return "skipped"
         admin = True
 
-    # Green and mergeable, yet a branch-protection ruleset (or a pending
-    # Copilot review) can leave the PR BLOCKED: a normal merge is refused
-    # and only an admin bypass — the web merge button — clears it.  Policy
-    # is never to bypass, so skip and let the end-of-run report flag it.
+    # Green and mergeable, yet a branch-protection ruleset can leave the PR
+    # BLOCKED: a normal merge is refused and only an admin bypass — the web
+    # merge button — clears it.  Policy is never to bypass, so skip and let
+    # the end-of-run report flag it.
     if not admin and refresh(pr)[2] == "BLOCKED":
         console.print(
             f"  [yellow]{pr.ref} is green + mergeable but BLOCKED[/] "
-            "(branch protection / pending Copilot review) — needs admin merge"
+            "(branch protection) — needs admin merge"
         )
         return "blocked"
 
