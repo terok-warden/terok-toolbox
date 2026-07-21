@@ -9,6 +9,12 @@ the [terok-ai](https://github.com/terok-ai) package family.
   `mkdocs-terok`, `terok-clearance`, `terok-shield`, `terok-sandbox`,
   `terok-executor`, and `terok`. Supports `--target {pypi, testpypi, gh-only}`
   for production, validation, and PyPI-skipping flows.
+- `scripts/terok-dependabot.py` — surveys the weekly Dependabot wave across
+  the package family, splits it into runtime deps vs. everything else, and
+  (after printing the summary and asking) automerges the everything-else
+  bucket one PR at a time — gating each on green CI, waiting out rebases —
+  then offers the runtime deps for one-by-one review. Stateless: re-run
+  reads afresh.
 - `warden` — host-side wrapper that creates and enters a persistent
   [distrobox](https://distrobox.it) container based on `fedora-toolbox:44`,
   with its own isolated `$HOME` and `--unshare-all` so warden's PAT, GPG key,
