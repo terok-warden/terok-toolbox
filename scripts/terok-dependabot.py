@@ -40,12 +40,15 @@ Merge mechanics the fleet imposes (verified against branch settings):
   clean — remedy the stuck PR by hand and re-run; the next run reads the
   world fresh.
 
+Run it with no arguments: it prints the two-bucket summary, then asks
+whether to start the automerge run.  Answer no (or Ctrl-C) to stop at the
+summary; answer yes to merge the everything-else bucket, after which the
+runtime deps are offered for one-by-one review.
+
 Usage:
-    terok-dependabot                       # summary of the open wave
-    terok-dependabot --repo terok-util     # ...narrowed to one repo
-    terok-dependabot merge                 # automerge everything-else
-    terok-dependabot merge --offer         # ...then walk runtime deps
-    terok-dependabot merge --pretend       # dry run: print, never merge
+    terok-dependabot                    # summary, then offer to automerge
+    terok-dependabot --repo terok-util  # ...narrowed to one repo
+    terok-dependabot --yes              # skip the confirm (automation)
 """
 
 from __future__ import annotations
@@ -374,7 +377,7 @@ def wait_mergeable(pr: PR, timeout: int) -> str:
     return "timeout"
 
 
-def merge_pr(pr: PR, *, admin: bool, pretend: bool) -> bool:
+def merge_pr(pr: PR, *, admin: bool) -> bool:
     """Squash-merge one PR; return True on success.
 
     ``admin`` bypasses the (non-)protection to force a red merge when the
@@ -385,9 +388,6 @@ def merge_pr(pr: PR, *, admin: bool, pretend: bool) -> bool:
            "--squash", "--delete-branch"]
     if admin:
         cmd.append("--admin")
-    if pretend:
-        console.print(f"  [dim]pretend:[/] {' '.join(cmd)}")
-        return True
     r = sh(*cmd, check=False)
     if r.returncode == 0:
         console.print(f"  [green]merged[/] {pr.ref}")
@@ -404,7 +404,6 @@ def merge_pr(pr: PR, *, admin: bool, pretend: bool) -> bool:
 class MergeCtx:
     """Knobs shared across the merge loops."""
 
-    pretend: bool
     skip_checks: bool
     check_timeout: int
 
@@ -442,7 +441,7 @@ def _merge_one(pr: PR, ctx: MergeCtx) -> str:
             return "skipped"
         admin = True
 
-    return "merged" if merge_pr(pr, admin=admin, pretend=ctx.pretend) else "failed"
+    return "merged" if merge_pr(pr, admin=admin) else "failed"
 
 
 def automerge(prs: list[PR], ctx: MergeCtx) -> None:
@@ -463,15 +462,18 @@ def automerge(prs: list[PR], ctx: MergeCtx) -> None:
     )
 
 
-def offer_runtime(prs: list[PR], ctx: MergeCtx, *, offer: bool) -> None:
-    """List runtime deps; with ``offer``, walk them one-by-one behind a prompt."""
+def offer_runtime(prs: list[PR], ctx: MergeCtx) -> None:
+    """Offer to walk the runtime deps one-by-one; otherwise leave them listed.
+
+    They are already shown in the summary table, so a declined offer just
+    leaves them open for consideration.
+    """
     if not prs:
         return
-    console.print(f"\n[bold]Runtime deps ({len(prs)})[/] — reach shipped installs, review each:")
-    for pr in sorted(prs, key=lambda p: (p.repo, p.number)):
-        console.print(f"  {pr.ref}  {pr.title}")
-    if not offer:
-        console.print("[dim]Re-run with --offer to merge these one-by-one.[/]")
+    if not click.confirm(
+        f"\nReview {len(prs)} runtime dep(s) one-by-one now?", default=False
+    ):
+        console.print("[dim]Runtime deps left open for consideration.[/]")
         return
     for pr in sorted(prs, key=lambda p: (p.repo, p.number)):
         console.print(f"\n[bold]{pr.ref}[/] — {pr.title}")
@@ -499,54 +501,39 @@ def _preflight(prs: list[PR]) -> None:
             )
 
 
-@click.group(invoke_without_command=True)
+@click.command()
 @click.option("--repo", "repos", multiple=True,
               help="Limit to these repo(s); repeatable. Default: the whole fleet.")
-@click.pass_context
-def cli(ctx: click.Context, repos: tuple[str, ...]) -> None:
-    """Survey and merge Dependabot PRs across the terok-ai fleet."""
-    ctx.ensure_object(dict)
-    ctx.obj["repos"] = list(repos) or FLEET
-    if ctx.invoked_subcommand is None:
-        render_summary(survey(ctx.obj["repos"]))
-
-
-@cli.command()
-@click.pass_context
-def summary(ctx: click.Context) -> None:
-    """Print the open Dependabot wave, split into the two buckets."""
-    render_summary(survey(ctx.obj["repos"]))
-
-
-@cli.command()
-@click.option("--pretend", is_flag=True, help="Print merge commands without running them.")
-@click.option("--offer", is_flag=True, help="After automerge, walk runtime deps one-by-one.")
 @click.option("--skip-checks", is_flag=True, help="Merge without waiting for CI (dangerous).")
 @click.option("--check-timeout", default=CHECK_TIMEOUT_DEFAULT, show_default=True,
               help="Seconds to wait for a PR's checks to settle.")
-@click.option("--yes", is_flag=True, help="Skip the pre-merge confirmation.")
-@click.pass_context
-def merge(ctx: click.Context, pretend: bool, offer: bool, skip_checks: bool,
-          check_timeout: int, yes: bool) -> None:
-    """Automerge everything-else, then review runtime deps."""
-    prs = survey(ctx.obj["repos"])
-    everything_else, runtime = render_summary(prs)
-    if not prs:
+@click.option("--yes", is_flag=True, help="Skip the automerge confirmation (automation).")
+def cli(repos: tuple[str, ...], skip_checks: bool, check_timeout: int, yes: bool) -> None:
+    """Survey the open Dependabot wave, then offer to automerge it.
+
+    Prints the two-bucket summary and asks whether to start.  The
+    everything-else bucket is automerged one PR at a time; runtime deps
+    are then offered for one-by-one review.
+    """
+    everything_else, runtime = render_summary(survey(list(repos) or FLEET))
+    if not (everything_else or runtime):
         return
-    _preflight(prs)
-    if not (yes or pretend) and not click.confirm(
-        f"\nAutomerge {len(everything_else)} everything-else PR(s)?", default=False
-    ):
-        die("aborted by operator")
-    mctx = MergeCtx(pretend=pretend, skip_checks=skip_checks, check_timeout=check_timeout)
-    automerge(everything_else, mctx)
-    offer_runtime(runtime, mctx, offer=offer)
+    _preflight(everything_else + runtime)
+
+    mctx = MergeCtx(skip_checks=skip_checks, check_timeout=check_timeout)
+    if everything_else and (yes or click.confirm(
+        f"\nStart automerge of {len(everything_else)} everything-else PR(s)?", default=False
+    )):
+        automerge(everything_else, mctx)
+    elif everything_else:
+        console.print("[dim]Automerge skipped.[/]")
+    offer_runtime(runtime, mctx)
 
 
 def main() -> None:
     """Entry point — turn Ctrl-C into a clean, actionable exit."""
     try:
-        cli(obj={})
+        cli()
     except KeyboardInterrupt:
         console.print(
             "\n[yellow]Interrupted.[/] Remedy any stuck PR by hand and re-run — "
