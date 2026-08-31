@@ -1456,8 +1456,11 @@ def seed_notes(plan: Plan, cache_dir: Path) -> None:
     """Materialise per-package release-notes drafts under *cache_dir*/notes/.
 
     Idempotent: existing files are preserved, never overwritten — operator
-    edits made between ``plan`` and ``execute`` survive.  To force a fresh
-    draft, delete the notes file and re-run.
+    edits made between ``plan`` and ``execute`` survive.  Every preserved
+    file is announced, so the operator can tell cached notes from freshly
+    generated ones (a re-run of a retired version quietly inherits the
+    previous run's drafts otherwise).  To force a fresh draft, delete the
+    notes file and re-run.
     """
     notes_dir = cache_dir / "notes"
     notes_dir.mkdir(parents=True, exist_ok=True)
@@ -1467,6 +1470,10 @@ def seed_notes(plan: Plan, cache_dir: Path) -> None:
         path = notes_dir / f"{pkg.repo}-v{pkg.new_version}.md"
         pkg.notes_path = str(path)
         if path.exists():
+            console.print(
+                f"  Notes kept from cache: [bold]{pkg.repo}[/] → {path}"
+                "  [dim](delete the file and re-run for a fresh draft)[/]"
+            )
             continue
         path.write_text(
             generate_release_notes(
@@ -2699,7 +2706,7 @@ def quick(
         # defaults" semantics — answering "edit" in unattended mode is
         # impossible anyway.
         if not alert_confirm(
-            "Accept default release notes? (n to edit)", default=False
+            "Ship the seeded release notes as-is? (n to edit)", default=False
         ):
             edit_notes(plan)
         alert_confirm("Proceed?", default=True, abort=True)
