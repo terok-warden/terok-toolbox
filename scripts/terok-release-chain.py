@@ -1452,21 +1452,33 @@ def plan_steps(
     return steps
 
 
-def seed_notes(plan: Plan, cache_dir: Path) -> None:
+def _notes_path(cache_dir: Path, pkg: PackagePlan) -> Path:
+    """Draft location for one package's release notes."""
+    return cache_dir / "notes" / f"{pkg.repo}-v{pkg.new_version}.md"
+
+
+def seed_notes(plan: Plan, cache_dir: Path, *, fresh: bool = False) -> None:
     """Materialise per-package release-notes drafts under *cache_dir*/notes/.
 
-    Idempotent: existing files are preserved, never overwritten — operator
-    edits made between ``plan`` and ``execute`` survive.  To force a fresh
-    draft, delete the notes file and re-run.
+    Existing files are preserved by default — operator edits made between
+    ``plan`` and ``execute`` survive — and every preserved file is
+    announced, so the operator can tell cached notes from freshly
+    generated ones (a re-run of a retired version quietly inherits the
+    previous run's drafts otherwise).  ``fresh=True`` regenerates every
+    draft, cached or not — ``quick``'s "seed new" answer.
     """
     notes_dir = cache_dir / "notes"
     notes_dir.mkdir(parents=True, exist_ok=True)
     for pkg in plan.packages:
         if not pkg.new_version:
             continue
-        path = notes_dir / f"{pkg.repo}-v{pkg.new_version}.md"
+        path = _notes_path(cache_dir, pkg)
         pkg.notes_path = str(path)
-        if path.exists():
+        if path.exists() and not fresh:
+            console.print(
+                f"  Notes kept from cache: [bold]{pkg.repo}[/] → {path}"
+                "  [dim](delete the file and re-run for a fresh draft)[/]"
+            )
             continue
         path.write_text(
             generate_release_notes(
@@ -1478,6 +1490,7 @@ def seed_notes(plan: Plan, cache_dir: Path) -> None:
                 pkg.pr_title,
             )
         )
+        console.print(f"  Notes seeded: [bold]{pkg.repo}[/] → {path}")
 
 
 def edit_notes(plan: Plan) -> None:
@@ -2688,19 +2701,38 @@ def quick(
         target=target,
         pin_style=pin_style,
     )
-    seed_notes(plan, cd)
-
     _render_plan_preview(plan)
 
-    if not yes:
-        # Default-N because the interactive operator usually wants to edit;
-        # plain Enter opens $EDITOR.  ``-y`` skips the prompt entirely and
-        # ships the seeded notes as-is, which matches ``-y``'s "auto-accept
-        # defaults" semantics — answering "edit" in unattended mode is
-        # impossible anyway.
-        if not alert_confirm(
-            "Accept default release notes? (n to edit)", default=False
-        ):
+    if yes:
+        # ``-y`` ships cached drafts where present and seeds the rest — the
+        # "use cache" answer; editing in unattended mode is impossible anyway.
+        seed_notes(plan, cd)
+    else:
+        cached = sorted(
+            pkg.repo
+            for pkg in plan.packages
+            if pkg.new_version and _notes_path(cd, pkg).exists()
+        )
+        # One answer, applied per package where it is valid: the cache
+        # answers keep every existing draft and seed only the missing ones;
+        # the new answers regenerate them all.  A run with cached drafts
+        # defaults to shipping them (operator edits, or a re-cut's previous
+        # notes — kept consciously); a first run defaults to seed-and-edit.
+        if cached:
+            console.print("[dim]Cached notes drafts exist for: " + ", ".join(cached) + "[/]")
+            legend = "c = use cache, ce = edit from cache, n = seed new, ne = seed new + edit"
+            choices, default = ["c", "ce", "n", "ne"], "c"
+        else:
+            legend = "n = seed new and use, ne = seed new + edit"
+            choices, default = ["n", "ne"], "ne"
+        choice = alert_prompt(
+            f"Release notes: {legend}",
+            type=click.Choice(choices),
+            default=default,
+            show_choices=False,
+        )
+        seed_notes(plan, cd, fresh=choice.startswith("n"))
+        if choice in ("ce", "ne"):
             edit_notes(plan)
         alert_confirm("Proceed?", default=True, abort=True)
 
