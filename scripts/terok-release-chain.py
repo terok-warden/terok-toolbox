@@ -800,8 +800,8 @@ def ensure_clone(repo: str, cache_dir: Path, org: str, fork: str, pr: int | None
     that add a new sibling dep on every consumer in one wave).
     """
     repo_dir = cache_dir / repo
-    upstream_url = f"git@github.com:{org}/{repo}.git"
-    fork_url = f"git@github.com:{fork}/{repo}.git"
+    upstream_url = GITHUB_SSH_URL.format(repo=f"{org}/{repo}")
+    fork_url = GITHUB_SSH_URL.format(repo=f"{fork}/{repo}")
     if (repo_dir / ".git").is_dir():
         ref_label = f"PR #{pr}" if pr is not None else "upstream/master"
         console.print(f"  [cyan]{repo:<16}[/] syncing to {ref_label}...", end="\r")
@@ -1687,24 +1687,27 @@ def _package(plan: Plan, repo: str) -> PackagePlan:
     return next(p for p in plan.packages if p.repo == repo)
 
 
-def _pr_head_remote(pkg: PackagePlan, repo_dir: Path) -> str:
-    """Restore the PR's fetch/push remote without changing the release-branch origin.
+def _release_remote(pkg: PackagePlan, repo_dir: Path) -> str:
+    """Select origin for new branches or restore the existing PR's fetch/push remote.
 
-    Configure it at checkout and push so resumed steps do not depend on an
+    Configure PR remotes at checkout and push so resumed steps do not depend on an
     earlier clone-sync step or a cached remote left by another release plan.
     """
+    if not pkg.pr_branch:
+        return "origin"
     if not pkg.pr_head_repo:
         die(f"Missing PR head repository for {pkg.repo}; regenerate the release plan")
     head_url = GITHUB_SSH_URL.format(repo=pkg.pr_head_repo)
-    for option in ("url", "pushurl"):
+    settings = {
+        "url": head_url,
+        "pushurl": head_url,
+        "fetch": f"+refs/heads/*:refs/remotes/{PR_HEAD_REMOTE}/*",
+    }
+    for option, value in settings.items():
         sh(
             "git", "config", "--replace-all", f"remote.{PR_HEAD_REMOTE}.{option}",
-            head_url, cwd=repo_dir,
+            value, cwd=repo_dir,
         )  # fmt: skip
-    sh(
-        "git", "config", "--replace-all", f"remote.{PR_HEAD_REMOTE}.fetch",
-        f"+refs/heads/*:refs/remotes/{PR_HEAD_REMOTE}/*", cwd=repo_dir,
-    )  # fmt: skip
     return PR_HEAD_REMOTE
 
 
@@ -1827,11 +1830,12 @@ def execute_step(step: Step, plan: Plan, ctx: Ctx):
 
         case StepKind.CHECKOUT:
             if p.get("source") == "pr":
-                remote = _pr_head_remote(_package(plan, step.package), repo_dir)
+                remote = _release_remote(_package(plan, step.package), repo_dir)
                 sh("git", "fetch", remote, p["branch"], cwd=repo_dir)
-                sh("git", "checkout", "-B", p["branch"], f"{remote}/{p['branch']}", cwd=repo_dir)
+                base = f"{remote}/{p['branch']}"
             else:
-                sh("git", "checkout", "-B", p["branch"], p["base"], cwd=repo_dir)
+                base = p["base"]
+            sh("git", "checkout", "-B", p["branch"], base, cwd=repo_dir)
 
         case StepKind.VERSION_BUMP:
             set_version_toml(repo_dir / "pyproject.toml", p["version"])
@@ -1900,23 +1904,18 @@ def execute_step(step: Step, plan: Plan, ctx: Ctx):
                 console.print("[dim]Branch is at upstream/master — nothing to push.[/]")
             else:
                 pkg = _package(plan, step.package)
-                if pkg.pr_branch:
-                    remote = _pr_head_remote(pkg, repo_dir)
-                    result = sh(
-                        "git", "push", "-u", remote, p["branch"], "--force-with-lease",
-                        cwd=repo_dir, check=False,
-                    )  # fmt: skip
-                    if result.returncode:
-                        die(
-                            f"Could not update PR branch {pkg.pr_head_repo}:{p['branch']}. "
-                            "Check fork write access and branch changes before resuming. "
-                            f"Stopping before merging or releasing {pkg.repo}.\n{result.stderr.strip()}"
-                        )
-                else:
-                    sh(
-                        "git", "push", "-u", "origin", p["branch"], "--force-with-lease",
-                        cwd=repo_dir,
-                    )  # fmt: skip
+                remote = _release_remote(pkg, repo_dir)
+                result = sh(
+                    "git", "push", "-u", remote, p["branch"], "--force-with-lease",
+                    cwd=repo_dir, check=False,
+                )  # fmt: skip
+                if result.returncode:
+                    target = pkg.pr_head_repo or f"{plan.gh_fork}/{pkg.repo}"
+                    die(
+                        f"Could not update release branch {target}:{p['branch']}. "
+                        "Check write access and branch changes before resuming. "
+                        f"Stopping before merging or releasing {pkg.repo}.\n{result.stderr.strip()}"
+                    )
 
         case StepKind.PR_CREATE:
             if _branch_matches_upstream(repo_dir):

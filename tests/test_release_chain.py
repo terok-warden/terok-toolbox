@@ -27,6 +27,7 @@ BRANCH = "fix/material-dependencies"
 PR_NUMBER = 149
 PR_URL = f"https://github.com/{UPSTREAM_OWNER}/{PACKAGE}/pull/{PR_NUMBER}"
 AUTHOR_EMAIL = "release-test@example.invalid"
+SSH_REPOSITORY_URL = "git@github.com:{owner}/{repo}.git"
 
 
 @dataclass(frozen=True)
@@ -59,19 +60,13 @@ def release(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> ModuleType:
     monkeypatch.setenv("GIT_AUTHOR_EMAIL", AUTHOR_EMAIL)
     monkeypatch.setenv("GIT_COMMITTER_NAME", "Release Test")
     monkeypatch.setenv("GIT_COMMITTER_EMAIL", AUTHOR_EMAIL)
-    run, popen = subprocess.run, subprocess.Popen
-
-    def git_run(args, *positional, **kwargs):
-        """Reject GitHub and publishing commands before subprocess execution."""
-        assert not isinstance(args, str) and args[0] == "git", args
-        return run(args, *positional, **kwargs)
+    popen = subprocess.Popen
 
     def git_popen(args, *positional, **kwargs):
-        """Apply the same guard to the CLI's streaming subprocess helper."""
+        """Reject external commands, including subprocess.run's underlying execution."""
         assert not isinstance(args, str) and args[0] == "git", args
         return popen(args, *positional, **kwargs)
 
-    monkeypatch.setattr(subprocess, "run", git_run)
     monkeypatch.setattr(subprocess, "Popen", git_popen)
     return module
 
@@ -155,6 +150,32 @@ def test_mixed_pr_plan_preserves_each_head_repository_in_json(release, monkeypat
 
 
 @pytest.mark.parametrize("fork", [UPSTREAM_OWNER, FORK_OWNER])
+@pytest.mark.parametrize("cached", [False, True], ids=["new", "cached"])
+def test_master_clone_keeps_configured_remotes_and_checkout(
+    release, monkeypatch, tmp_path, fork, cached
+):
+    """Both clone paths preserve the canonical source and configured release destination."""
+    repo_dir = tmp_path / PACKAGE
+    if cached:
+        (repo_dir / ".git").mkdir(parents=True)
+    run = Mock(return_value=subprocess.CompletedProcess([], 0, "", ""))
+    monkeypatch.setattr(release, "sh", run)
+    upstream_url = SSH_REPOSITORY_URL.format(owner=UPSTREAM_OWNER, repo=PACKAGE)
+    origin_url = SSH_REPOSITORY_URL.format(owner=fork, repo=PACKAGE)
+
+    release.ensure_clone(PACKAGE, tmp_path, UPSTREAM_OWNER, fork)
+
+    if cached:
+        run.assert_any_call("git", "remote", "set-url", "upstream", upstream_url, cwd=repo_dir)
+        run.assert_any_call("git", "remote", "set-url", "origin", origin_url, cwd=repo_dir)
+    else:
+        run.assert_any_call("git", "clone", "--quiet", upstream_url, str(repo_dir))
+        run.assert_any_call("git", "remote", "rename", "origin", "upstream", cwd=repo_dir)
+        run.assert_any_call("git", "remote", "add", "origin", origin_url, cwd=repo_dir)
+    run.assert_any_call("git", "reset", "--hard", "upstream/master", "-q", cwd=repo_dir)
+
+
+@pytest.mark.parametrize("fork", [UPSTREAM_OWNER, FORK_OWNER])
 def test_master_release_still_uses_configured_origin(release, repositories, fork, monkeypatch):
     """Master releases create a release PR and push to the operator's configured fork."""
     repos = repositories(origin_owner=fork)
@@ -163,11 +184,14 @@ def test_master_release_still_uses_configured_origin(release, repositories, fork
     assert checkout.params["base"] == "upstream/master"
     assert any(step.kind == release.StepKind.PR_CREATE for step in plan.steps)
     ctx = release.Ctx(cache_dir=repos.cache)
+    upstream_before = _git(repos.upstream, "rev-parse", "master")
     release.execute_step(checkout, plan, ctx)
     commit = _commit(repos.checkout, "release from master")
     release.execute_step(_step(release, plan, "GIT_PUSH"), plan, ctx)
     branch = checkout.params["branch"]
     assert _git(repos.origin, "rev-parse", branch) == commit
+    assert _git(repos.upstream, "rev-parse", "master") == upstream_before
+    assert release.PR_HEAD_REMOTE not in _git(repos.checkout, "remote").splitlines()
     if fork != UPSTREAM_OWNER:
         assert branch not in _git(repos.upstream, "branch", "--list", branch)
 
@@ -242,17 +266,19 @@ def test_resume_push_restores_head_remote_without_resetting_work(release, reposi
     assert _git(repos.head, "rev-parse", BRANCH) == commit
 
 
-def test_rejected_pr_push_stops_before_merge_or_tag(
-    release, repositories, tmp_path, capsys, monkeypatch
+@pytest.mark.parametrize("master", [True, False], ids=["master", "fork-pr"])
+def test_rejected_push_stops_before_merge_or_tag(
+    release, repositories, tmp_path, monkeypatch, master
 ):
-    """A denied fork push cannot continue with an unmodified PR or publish a release."""
+    """A denied push cannot continue to merge an unmodified branch or publish a release."""
     repos = repositories()
-    plan = _plan(release, head_repo=repos.head_repo)
+    plan = _plan(release, head_repo=repos.head_repo, master=master)
+    target = repos.origin if master else repos.head
     ctx = release.Ctx(cache_dir=repos.cache, plan_path=tmp_path / "plan.json")
     release.execute_step(_step(release, plan, "CHECKOUT"), plan, ctx)
-    before = _git(repos.head, "rev-parse", BRANCH)
+    before = _git(target, "show-ref", "--heads")
     _commit(repos.checkout, "rejected preparation")
-    hook = repos.head / "hooks" / "pre-receive"
+    hook = target / "hooks" / "pre-receive"
     hook.write_text("#!/bin/sh\nexit 1\n")
     hook.chmod(0o755)
     plan.steps = [_step(release, plan, kind) for kind in ("GIT_PUSH", "PR_MERGE", "TAG")]
@@ -267,26 +293,41 @@ def test_rejected_pr_push_stops_before_merge_or_tag(
     with pytest.raises(SystemExit):
         release.execute_plan(plan, mode=release.ExecMode.EXECUTE, ctx=ctx)
     assert [step.status for step in plan.steps] == ["failed", "pending", "pending"]
-    assert repos.head_repo in capsys.readouterr().err
-    assert _git(repos.head, "rev-parse", BRANCH) == before
+    assert _git(target, "show-ref", "--heads") == before
     restored = release.Plan.model_validate_json(ctx.plan_path.read_text())
     assert restored.steps[0].status == "failed"
 
 
-def test_concurrent_pr_update_is_not_overwritten(release, repositories, tmp_path):
+@pytest.mark.parametrize("master", [True, False], ids=["master", "fork-pr"])
+def test_concurrent_update_is_not_overwritten(release, repositories, tmp_path, master):
     """Force-with-lease preserves another author's work after the checkout snapshot."""
     repos = repositories()
-    plan = _plan(release, head_repo=repos.head_repo)
+    plan = _plan(release, head_repo=repos.head_repo, master=master)
+    target = repos.origin if master else repos.head
     ctx = release.Ctx(cache_dir=repos.cache)
     release.execute_step(_step(release, plan, "CHECKOUT"), plan, ctx)
+    branch = _step(release, plan, "GIT_PUSH").params["branch"]
+    if master:
+        _git(repos.checkout, "push", "-u", "origin", branch)
     _commit(repos.checkout, "release preparation")
     other = tmp_path / "other-author"
-    _git(tmp_path, "clone", "--branch", BRANCH, str(repos.head), str(other))
-    concurrent = _commit(other, "concurrent PR update")
-    _git(other, "push", "origin", BRANCH)
+    _git(tmp_path, "clone", "--branch", branch, str(target), str(other))
+    concurrent = _commit(other, "concurrent update")
+    _git(other, "push", "origin", branch)
     with pytest.raises(SystemExit):
         release.execute_step(_step(release, plan, "GIT_PUSH"), plan, ctx)
-    assert _git(repos.head, "rev-parse", BRANCH) == concurrent
+    assert _git(target, "rev-parse", branch) == concurrent
+
+
+@pytest.mark.parametrize("master", [True, False], ids=["master", "fork-pr"])
+def test_push_at_upstream_master_is_a_noop(release, monkeypatch, tmp_path, master):
+    """No release payload means no push or remote configuration for either source."""
+    plan = _plan(release, master=master)
+    monkeypatch.setattr(release, "_branch_matches_upstream", Mock(return_value=True))
+    run = Mock(side_effect=AssertionError("No git command expected"))
+    monkeypatch.setattr(release, "sh", run)
+    release.execute_step(_step(release, plan, "GIT_PUSH"), plan, release.Ctx(cache_dir=tmp_path))
+    run.assert_not_called()
 
 
 def test_old_pr_plan_without_head_repository_fails_closed(release, repositories, capsys):
@@ -316,7 +357,7 @@ def _plan(
         pr_number=None if master else PR_NUMBER,
         pr_branch=None if master else BRANCH,
         pr_url=None if master else PR_URL,
-        pr_head_repo=head_repo,
+        pr_head_repo=None if master else head_repo,
     )
     return release.Plan(
         packages=[pkg],
