@@ -74,6 +74,17 @@ warden terok-release execute plan.json
 warden gh auth status                           # any tool in the image
 ```
 
+### Releasing an existing PR
+
+For a `package:PR` source, release-preparation commits go to that PR's original
+head repository and branch, including personal forks. The publishing identity
+must be able to push to that branch. A rejected push stops the release before
+merging or tagging; the script never substitutes a branch in another repository.
+
+Releases from master still create their release-preparation branch in the
+configured `--fork` (`terok-ai` by default inside warden). Both routes merge
+and tag in the upstream repository.
+
 ## Release notes
 
 After `plan` (and inside `quick`), the script seeds a Markdown notes
@@ -173,6 +184,17 @@ to pull a fresh `fedora-toolbox:44` or to discard accumulated state):
 
 ```bash
 WARDEN_REBUILD=1 warden
+```
+
+## Development checks
+
+The release-chain tests use temporary local Git repositories and mocked GitHub
+calls. They do not run containers, contact GitHub, or publish releases.
+
+```bash
+uv run --no-project --python 3.12 \
+    --with click --with tomlkit --with 'pydantic>=2' --with rich --with pytest \
+    pytest tests/
 ```
 
 ## License

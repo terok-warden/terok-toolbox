@@ -191,6 +191,8 @@ BUMP_DEPS_BRANCH_PREFIX = "chore/bump-deps"
 RELEASE_COMMIT_PREFIX = "release:"
 BUMP_DEPS_COMMIT = "chore: bump sibling deps"
 AUTOMATED_RELEASE_LABEL = "automated-release"
+PR_HEAD_REMOTE = "pr-head"
+GITHUB_SSH_URL = "git@github.com:{repo}.git"
 
 
 def die(msg: str) -> Never:
@@ -464,6 +466,8 @@ class PackagePlan(BaseModel):
     new_version: str | None = None
     pr_number: int | None = None
     pr_branch: str | None = None
+    pr_head_repo: str | None = None
+    """Owner/repository of an existing PR's branch, independent of the release fork."""
     pr_url: str | None = None
     """Populated up-front for ``:PR`` overrides; set by ``PR_CREATE`` for
     master releases as soon as the script opens its own PR.  Surfaced at the
@@ -796,8 +800,8 @@ def ensure_clone(repo: str, cache_dir: Path, org: str, fork: str, pr: int | None
     that add a new sibling dep on every consumer in one wave).
     """
     repo_dir = cache_dir / repo
-    upstream_url = f"git@github.com:{org}/{repo}.git"
-    fork_url = f"git@github.com:{fork}/{repo}.git"
+    upstream_url = GITHUB_SSH_URL.format(repo=f"{org}/{repo}")
+    fork_url = GITHUB_SSH_URL.format(repo=f"{fork}/{repo}")
     if (repo_dir / ".git").is_dir():
         ref_label = f"PR #{pr}" if pr is not None else "upstream/master"
         console.print(f"  [cyan]{repo:<16}[/] syncing to {ref_label}...", end="\r")
@@ -957,7 +961,7 @@ def pr_info(number: int, gh_repo: str) -> dict:
         "--repo",
         gh_repo,
         "--json",
-        "headRefName,state,title,url",
+        "headRefName,headRepository,state,title,url",
         capture=True,
     )
     return json.loads(r.stdout)
@@ -1376,7 +1380,6 @@ def _branch_for(pkg: PackagePlan, release_name: str) -> str:
 def plan_steps(
     pkg: PackagePlan,
     org: str,
-    fork: str,
     name: str,
     target: str,
     pin_style: str,
@@ -1426,7 +1429,7 @@ def plan_steps(
             add(StepKind.CHANGELOG_UPDATE, version=pkg.new_version, title=name)
     add(StepKind.LOCK)
     add(StepKind.GIT_COMMIT, message=commit_msg)
-    add(StepKind.GIT_PUSH, branch=branch, fork=fork)
+    add(StepKind.GIT_PUSH, branch=branch)
     if needs_new_pr:
         pr_body = (
             f"Automated release bump to v{pkg.new_version}."
@@ -1592,6 +1595,7 @@ def generate_plan(
         # Determine action — stop_at wins over pr_specs (deps-only, no release)
         pr_num: int | None = None
         pr_branch: str | None = None
+        pr_head_repo: str | None = None
         pr_url: str | None = None
         pr_title: str | None = None
         if pr_specs and repo in pr_specs:
@@ -1600,6 +1604,10 @@ def generate_plan(
                 die(
                     f"PR #{pr_specs[repo]} for {repo} is {info.get('state', 'unknown')} — must be OPEN"
                 )
+            head_repo = info["headRepository"] or die(
+                f"PR #{pr_specs[repo]} for {repo} has no accessible head repository"
+            )
+            pr_head_repo = head_repo["nameWithOwner"]
             pr_num, pr_branch, pr_url, pr_title = (
                 pr_specs[repo],
                 info["headRefName"],
@@ -1647,13 +1655,14 @@ def generate_plan(
             previous_release_version=previous if new_ver else None,
             pr_number=pr_num,
             pr_branch=pr_branch,
+            pr_head_repo=pr_head_repo,
             pr_url=pr_url,
             pr_title=pr_title,
             sibling_deps=sibling_deps,
         )
         packages.append(pkg)
         all_steps.extend(
-            plan_steps(pkg, org, fork, release_name, target, pin_style, prerelease)
+            plan_steps(pkg, org, release_name, target, pin_style, prerelease)
         )
         if new_ver:
             released[repo] = new_ver
@@ -1676,6 +1685,30 @@ def generate_plan(
 def _package(plan: Plan, repo: str) -> PackagePlan:
     """Locate the ``PackagePlan`` for *repo* in *plan*."""
     return next(p for p in plan.packages if p.repo == repo)
+
+
+def _release_remote(pkg: PackagePlan, repo_dir: Path) -> str:
+    """Select origin for new branches or restore the existing PR's fetch/push remote.
+
+    Configure PR remotes at checkout and push so resumed steps do not depend on an
+    earlier clone-sync step or a cached remote left by another release plan.
+    """
+    if not pkg.pr_branch:
+        return "origin"
+    if not pkg.pr_head_repo:
+        die(f"Missing PR head repository for {pkg.repo}; regenerate the release plan")
+    head_url = GITHUB_SSH_URL.format(repo=pkg.pr_head_repo)
+    settings = {
+        "url": head_url,
+        "pushurl": head_url,
+        "fetch": f"+refs/heads/*:refs/remotes/{PR_HEAD_REMOTE}/*",
+    }
+    for option, value in settings.items():
+        sh(
+            "git", "config", "--replace-all", f"remote.{PR_HEAD_REMOTE}.{option}",
+            value, cwd=repo_dir,
+        )  # fmt: skip
+    return PR_HEAD_REMOTE
 
 
 def _find_pr_url(package: str, plan: Plan) -> str:
@@ -1797,10 +1830,12 @@ def execute_step(step: Step, plan: Plan, ctx: Ctx):
 
         case StepKind.CHECKOUT:
             if p.get("source") == "pr":
-                sh("git", "fetch", "origin", p["branch"], cwd=repo_dir)
-                sh("git", "checkout", "-B", p["branch"], f"origin/{p['branch']}", cwd=repo_dir)
+                remote = _release_remote(_package(plan, step.package), repo_dir)
+                sh("git", "fetch", remote, p["branch"], cwd=repo_dir)
+                base = f"{remote}/{p['branch']}"
             else:
-                sh("git", "checkout", "-B", p["branch"], p["base"], cwd=repo_dir)
+                base = p["base"]
+            sh("git", "checkout", "-B", p["branch"], base, cwd=repo_dir)
 
         case StepKind.VERSION_BUMP:
             set_version_toml(repo_dir / "pyproject.toml", p["version"])
@@ -1868,7 +1903,19 @@ def execute_step(step: Step, plan: Plan, ctx: Ctx):
             if _branch_matches_upstream(repo_dir):
                 console.print("[dim]Branch is at upstream/master — nothing to push.[/]")
             else:
-                sh("git", "push", "-u", "origin", p["branch"], "--force-with-lease", cwd=repo_dir)
+                pkg = _package(plan, step.package)
+                remote = _release_remote(pkg, repo_dir)
+                result = sh(
+                    "git", "push", "-u", remote, p["branch"], "--force-with-lease",
+                    cwd=repo_dir, check=False,
+                )  # fmt: skip
+                if result.returncode:
+                    target = pkg.pr_head_repo or f"{plan.gh_fork}/{pkg.repo}"
+                    die(
+                        f"Could not update release branch {target}:{p['branch']}. "
+                        "Check write access and branch changes before resuming. "
+                        f"Stopping before merging or releasing {pkg.repo}.\n{result.stderr.strip()}"
+                    )
 
         case StepKind.PR_CREATE:
             if _branch_matches_upstream(repo_dir):
