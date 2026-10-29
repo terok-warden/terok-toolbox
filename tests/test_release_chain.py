@@ -17,6 +17,7 @@ from typing import Any
 from unittest.mock import Mock
 
 import pytest
+from click.testing import CliRunner
 
 SCRIPT_PATH = Path(__file__).resolve().parents[1] / "scripts" / "terok-release-chain.py"
 UPSTREAM_OWNER = "terok-ai"
@@ -176,31 +177,35 @@ def test_quick_validates_pr_heads_before_executing_any_package(
     monkeypatch.setattr(release, "pr_info", lambda _, repo: metadata[repo.split("/", 1)[1]])
     execute = Mock()
     monkeypatch.setattr(release, "execute_plan", execute)
-    arguments = {
-        "chain_spec": "util%amin,shield:485,clearance:267",
-        "version_step": "auto",
-        "release_name": "Shield Harvester",
-        "upgrade_pinned": True,
-        "open_top": False,
-        "prerelease": False,
-        "target": "gh-only",
-        "pin_style": None,
-        "org": UPSTREAM_OWNER,
-        "fork": UPSTREAM_OWNER,
-        "cache_dir": str(tmp_path),
-        "yes": True,
-        "skip_checks": False,
-        "check_timeout": 900,
-    }
+    version = Mock(return_value=subprocess.CompletedProcess([], 0, "gh version 2.87.3", ""))
+    monkeypatch.setattr(release.subprocess, "run", version)
+    arguments = [
+        "quick",
+        "util%amin,shield:485,clearance:267",
+        "--target=gh-only",
+        "--upgrade-pinned",
+        "-n",
+        "Shield Harvester",
+        "--org",
+        UPSTREAM_OWNER,
+        "--fork",
+        UPSTREAM_OWNER,
+        "--cache-dir",
+        str(tmp_path),
+        "--yes",
+    ]
+    result = CliRunner().invoke(release.cli, arguments)
+    version.assert_called_once_with(["gh", "--version"], capture_output=True, text=True, timeout=5)
     if missing_field:
-        with pytest.raises(SystemExit):
-            release.quick.callback(**arguments)
+        assert result.exit_code != 0
+        error = " ".join(result.output.split())
+        assert "PR #267 for terok-clearance" in error
+        assert ".".join(missing_field) in error
         execute.assert_not_called()
         assert not list((tmp_path / "plans").glob("*.json"))
         return
 
-    release.quick.callback(**arguments)
-
+    assert result.exit_code == 0, result.output
     execute.assert_called_once()
     (plan_path,) = (tmp_path / "plans").glob("*.json")
     saved = release.Plan.model_validate_json(plan_path.read_text())

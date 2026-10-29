@@ -1606,8 +1606,12 @@ def generate_plan(
                 )
             head_name = (info.get("headRepository") or {}).get("name")
             head_owner = (info.get("headRepositoryOwner") or {}).get("login")
-            if not head_name or not head_owner:
-                die(f"PR #{pr_specs[repo]} for {repo} has no accessible head repository")
+            for field, value in (
+                ("headRepository.name", head_name),
+                ("headRepositoryOwner.login", head_owner),
+            ):
+                if not value:
+                    die(f"PR #{pr_specs[repo]} for {repo} is missing {field} in gh metadata")
             pr_head_repo = f"{head_owner}/{head_name}"
             pr_num, pr_branch, pr_url, pr_title = (
                 pr_specs[repo],
