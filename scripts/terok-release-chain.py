@@ -961,7 +961,7 @@ def pr_info(number: int, gh_repo: str) -> dict:
         "--repo",
         gh_repo,
         "--json",
-        "headRefName,headRepository,state,title,url",
+        "headRefName,headRepository,headRepositoryOwner,state,title,url",
         capture=True,
     )
     return json.loads(r.stdout)
@@ -1604,10 +1604,11 @@ def generate_plan(
                 die(
                     f"PR #{pr_specs[repo]} for {repo} is {info.get('state', 'unknown')} — must be OPEN"
                 )
-            head_repo = info["headRepository"] or die(
-                f"PR #{pr_specs[repo]} for {repo} has no accessible head repository"
-            )
-            pr_head_repo = head_repo["nameWithOwner"]
+            head_name = (info.get("headRepository") or {}).get("name")
+            head_owner = (info.get("headRepositoryOwner") or {}).get("login")
+            if not head_name or not head_owner:
+                die(f"PR #{pr_specs[repo]} for {repo} has no accessible head repository")
+            pr_head_repo = f"{head_owner}/{head_name}"
             pr_num, pr_branch, pr_url, pr_title = (
                 pr_specs[repo],
                 info["headRefName"],
@@ -1696,7 +1697,7 @@ def _release_remote(pkg: PackagePlan, repo_dir: Path) -> str:
     if not pkg.pr_branch:
         return "origin"
     if not pkg.pr_head_repo:
-        die(f"Missing PR head repository for {pkg.repo}; regenerate the release plan")
+        die(f"Missing PR head repository for {pkg.repo}; repair the saved plan before resuming")
     head_url = GITHUB_SSH_URL.format(repo=pkg.pr_head_repo)
     settings = {
         "url": head_url,
